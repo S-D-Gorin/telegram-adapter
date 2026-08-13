@@ -1,1 +1,19 @@
-"""Sprotect events, commands and results transport boundary (Stage 1 placeholder)."""
+"""Sprotect transport boundary."""
+
+from .client import (
+    BootstrapError,
+    PairingState,
+    PermanentBootstrapError,
+    SprotectBootstrapClient,
+    TokenAlreadyIssuedError,
+    TransientBootstrapError,
+)
+
+__all__ = [
+    "BootstrapError",
+    "PairingState",
+    "PermanentBootstrapError",
+    "SprotectBootstrapClient",
+    "TokenAlreadyIssuedError",
+    "TransientBootstrapError",
+]
