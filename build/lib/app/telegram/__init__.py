@@ -6,10 +6,13 @@ from .client import (
     TelegramPollingConflictError,
     TransientTelegramError,
 )
+from .operations import TelegramOperationError, TelegramOperationsClient
 
 __all__ = [
     "PermanentTelegramError",
     "TelegramBotClient",
     "TelegramPollingConflictError",
     "TransientTelegramError",
+    "TelegramOperationError",
+    "TelegramOperationsClient",
 ]

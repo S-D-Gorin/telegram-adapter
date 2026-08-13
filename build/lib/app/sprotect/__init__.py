@@ -20,6 +20,11 @@ from .commands import (
     PlatformCommandsWebSocketClient,
     is_authentication_close,
 )
+from .results import (
+    PermanentResultDeliveryError,
+    SprotectPlatformResultsClient,
+    TransientResultDeliveryError,
+)
 
 __all__ = [
     "BootstrapError",
@@ -36,4 +41,7 @@ __all__ = [
     "CommandTransportError",
     "PlatformCommandsWebSocketClient",
     "is_authentication_close",
+    "PermanentResultDeliveryError",
+    "SprotectPlatformResultsClient",
+    "TransientResultDeliveryError",
 ]

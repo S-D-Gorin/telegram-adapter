@@ -23,13 +23,18 @@ from app.sprotect import (
     CommandTransportError,
     PlatformCommandsWebSocketClient,
     is_authentication_close,
+    PermanentResultDeliveryError,
+    SprotectPlatformResultsClient,
+    TransientResultDeliveryError,
 )
-from app.storage import AdapterIdentity, PlatformOperation, SQLiteStorage
+from app.storage import AdapterIdentity, PendingResult, PlatformOperation, SQLiteStorage
 from app.telegram import (
     PermanentTelegramError,
     TelegramBotClient,
     TelegramPollingConflictError,
     TransientTelegramError,
+    TelegramOperationError,
+    TelegramOperationsClient,
 )
 from websockets.exceptions import ConnectionClosed
 
@@ -45,6 +50,8 @@ class Application:
         telegram_client: TelegramBotClient | None = None,
         platform_events_client: SprotectPlatformEventsClient | None = None,
         platform_commands_client: PlatformCommandsWebSocketClient | None = None,
+        telegram_operations_client: TelegramOperationsClient | None = None,
+        platform_results_client: SprotectPlatformResultsClient | None = None,
         initial_retry_delay: float = 2.0,
         max_retry_delay: float = 60.0,
     ) -> None:
@@ -54,16 +61,25 @@ class Application:
         self._telegram_client = telegram_client
         self._platform_events_client = platform_events_client
         self._platform_commands_client = platform_commands_client
+        self._telegram_operations_client = telegram_operations_client
+        self._platform_results_client = platform_results_client
         self._initial_retry_delay = initial_retry_delay
         self._max_retry_delay = max_retry_delay
         self._pairing_task: asyncio.Task[None] | None = None
         self._polling_task: asyncio.Task[None] | None = None
         self._commands_task: asyncio.Task[None] | None = None
+        self._executor_task: asyncio.Task[None] | None = None
+        self._result_delivery_task: asyncio.Task[None] | None = None
         self._started = False
         self._logger = logging.getLogger(__name__)
 
     async def start(self) -> None:
         await self.storage.initialize()
+        unknown_count = await self.storage.mark_executing_operations_unknown()
+        if unknown_count:
+            self._logger.error(
+                "platform_operation_execution_unknown count=%s; automatic Telegram replay is disabled", unknown_count
+            )
         identity, created = await self.storage.get_or_create_identity()
         self._started = True
         self._logger.info("adapter started", extra=self.config.safe_details())
@@ -76,6 +92,7 @@ class Application:
             self._log_ready(identity)
             self._start_polling(identity)
             self._start_commands(identity)
+            self._start_execution(identity)
             return
         if identity.pairing_status == "token_unrecoverable":
             self._logger.error(
@@ -87,7 +104,13 @@ class Application:
     async def stop(self) -> None:
         if not self._started:
             return
-        for task_name in ("_commands_task", "_polling_task", "_pairing_task"):
+        for task_name in (
+            "_result_delivery_task",
+            "_executor_task",
+            "_commands_task",
+            "_polling_task",
+            "_pairing_task",
+        ):
             task = getattr(self, task_name)
             if task is None:
                 continue
@@ -101,6 +124,10 @@ class Application:
             await self._telegram_client.close()
         if self._platform_events_client is not None:
             await self._platform_events_client.close()
+        if self._telegram_operations_client is not None:
+            await self._telegram_operations_client.close()
+        if self._platform_results_client is not None:
+            await self._platform_results_client.close()
         await self._client.close()
         await self.storage.close()
         self._started = False
@@ -130,6 +157,7 @@ class Application:
                 self._log_ready(identity)
                 self._start_polling(identity)
                 self._start_commands(identity)
+                self._start_execution(identity)
                 return
             except TokenAlreadyIssuedError:
                 await self.storage.update_pairing_status("token_unrecoverable")
@@ -165,6 +193,22 @@ class Application:
         self._commands_task = asyncio.create_task(
             self._commands_loop(identity.adapter_id), name="platform-command-websocket"
         )
+
+    def _start_execution(self, identity: AdapterIdentity) -> None:
+        if identity.adapter_token is None:
+            return
+        self._telegram_operations_client = self._telegram_operations_client or TelegramOperationsClient(
+            self.config.bot_token
+        )
+        self._platform_results_client = self._platform_results_client or SprotectPlatformResultsClient(
+            self.config.server_api, identity.adapter_token
+        )
+        if self._executor_task is None:
+            self._executor_task = asyncio.create_task(self._executor_loop(), name="platform-operation-executor")
+        if self._result_delivery_task is None:
+            self._result_delivery_task = asyncio.create_task(
+                self._result_delivery_loop(), name="platform-result-delivery"
+            )
 
     async def _polling_loop(self, adapter_id: str) -> None:
         assert self._telegram_client is not None
@@ -314,6 +358,123 @@ class Application:
             )
         else:
             self._logger.info("platform_operation_duplicate operation_id=%s", operation.operation_id)
+
+    async def _executor_loop(self) -> None:
+        assert self._telegram_operations_client is not None
+        delay = self._initial_retry_delay
+        while True:
+            operation = await self.storage.claim_next_platform_operation()
+            if operation is None:
+                await asyncio.sleep(0.2)
+                continue
+            self._logger.info(
+                "platform_operation_executing operation_id=%s operation_type=%s attempt=%s",
+                operation.operation_id,
+                operation.operation_type,
+                operation.attempt_count,
+            )
+            try:
+                result_payload = await self._execute_operation(operation)
+            except TelegramOperationError as error:
+                if error.retryable and operation.attempt_count < 5:
+                    await self.storage.requeue_platform_operation(operation.operation_id)
+                    self._logger.warning(
+                        "platform_operation_retry operation_id=%s retry_in=%.0fs code=%s",
+                        operation.operation_id,
+                        delay,
+                        error.code,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, self._max_retry_delay)
+                    continue
+                if error.ambiguous:
+                    await self.storage.mark_executing_operations_unknown()
+                    self._logger.error(
+                        "platform_operation_execution_unknown operation_id=%s code=%s",
+                        operation.operation_id,
+                        error.code,
+                    )
+                    delay = self._initial_retry_delay
+                    continue
+                await self._complete_with_result(
+                    operation,
+                    status="failed",
+                    result={},
+                    error={"code": error.code},
+                )
+            except Exception:
+                # An unexpected local failure has unknown action state, so never replay it automatically.
+                await self.storage.mark_executing_operations_unknown()
+                self._logger.exception("platform_operation_execution_unknown operation_id=%s", operation.operation_id)
+            else:
+                await self._complete_with_result(operation, status="succeeded", result=result_payload, error=None)
+            delay = self._initial_retry_delay
+
+    async def _execute_operation(self, operation: PlatformOperation) -> dict[str, object]:
+        assert self._telegram_operations_client is not None
+        if operation.operation_type == "send_message":
+            return await self._telegram_operations_client.send_message(operation.payload)
+        if operation.operation_type == "delete_message":
+            return await self._telegram_operations_client.delete_message(operation.payload)
+        raise TelegramOperationError("unsupported_operation")
+
+    async def _complete_with_result(
+        self,
+        operation: PlatformOperation,
+        *,
+        status: str,
+        result: dict[str, object],
+        error: dict[str, object] | None,
+    ) -> None:
+        pending_result = PendingResult(
+            result_id=str(uuid.uuid4()),
+            operation_id=operation.operation_id,
+            schema_version=1,
+            platform="telegram",
+            status=status,
+            result=result,
+            error=error,
+            completed_at=_occurred_at(),
+            delivery_status="pending",
+        )
+        await self.storage.complete_operation_with_result(pending_result)
+        self._logger.info(
+            "platform_operation_completed operation_id=%s result_id=%s status=%s",
+            operation.operation_id,
+            pending_result.result_id,
+            status,
+        )
+
+    async def _result_delivery_loop(self) -> None:
+        assert self._platform_results_client is not None
+        delay = self._initial_retry_delay
+        while True:
+            pending_results = await self.storage.list_pending_results()
+            if not pending_results:
+                await asyncio.sleep(0.2)
+                continue
+            for pending_result in pending_results:
+                try:
+                    outcome = await self._platform_results_client.deliver(pending_result)
+                except TransientResultDeliveryError as error:
+                    self._logger.warning(
+                        "platform_result_retry result_id=%s retry_in=%.0fs: %s",
+                        pending_result.result_id,
+                        delay,
+                        error,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, self._max_retry_delay)
+                    break
+                except PermanentResultDeliveryError as error:
+                    self._logger.error(
+                        "platform_result_delivery_degraded result_id=%s: %s", pending_result.result_id, error
+                    )
+                    await asyncio.sleep(self._max_retry_delay)
+                    break
+                await self.storage.mark_result_delivered(pending_result.result_id)
+                delay = self._initial_retry_delay
+                self._logger.info("platform_result_delivered result_id=%s outcome=%s", pending_result.result_id, outcome)
 
 
 def _occurred_at() -> str:

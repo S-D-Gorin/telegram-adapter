@@ -6,10 +6,11 @@ The intended transport boundaries are:
 
 ```text
 Telegram → Adapter → HTTPS Platform Events → Sprotect
-Sprotect → WebSocket Operations → Adapter
+Sprotect → WebSocket Operations → Adapter → Telegram
+Adapter → HTTPS Platform Results → Sprotect
 ```
 
-The adapter bootstraps a persistent identity with Sprotect and waits for an Organization owner to pair it in Guardian. Once paired, it long-polls Telegram and sends raw Telegram Updates to Sprotect Platform Events API. It also receives WebSocket operations, persistently stores them, and ACKs their receipt. Stage 4 does **not** execute operations through Telegram API and does not send Platform Results.
+The adapter bootstraps a persistent identity with Sprotect and waits for an Organization owner to pair it in Guardian. Once paired, it long-polls Telegram, sends raw Telegram Updates to Platform Events API, receives WebSocket operations, and executes supported Telegram operations (`send_message`, `delete_message`). Terminal outcomes are durably stored before the adapter sends a Platform Result.
 
 ## Run with Docker Compose
 
@@ -46,7 +47,13 @@ The Docker healthcheck verifies that this initialized database remains readable;
 
 The adapter connects to `/api/v1/platform-adapters/commands/ws/` using `Authorization: Bearer <adapter_token>`. An incoming operation is validated, committed to SQLite, and only then ACKed. The operation inbox has a unique `operation_id`: a redelivery with unchanged content is ACKed again without a second row; a reused ID with changed content is rejected as a protocol violation. WebSocket reconnects do not stop Telegram inbound polling.
 
-ACK means only that the adapter has durably received the operation. `send_message`, `delete_message`, and every other operation remain unexecuted until a later stage.
+ACK means only that the adapter has durably received the operation; it does not mean Telegram has executed it.
+
+## Execution and result delivery
+
+The local inbox lifecycle is `received → executing → completed`; a completed operation has exactly one durable pending result with a stable UUID. The result is posted to `POST /api/v1/platform-adapters/results/` with the adapter Bearer token until Sprotect returns `202 accepted` or `200 duplicate`, after which it is locally marked delivered. Network failures and `5xx` retry with the unchanged result envelope; terminal `4xx` leave the result durable and log a degraded state.
+
+Telegram cannot prove whether a `sendMessage` request succeeded if the process crashes or loses transport after marking the operation `executing`. On startup those rows become `execution_unknown` and are deliberately not replayed automatically, preventing a duplicate user-visible message. Rate-limit (`429`) retries are bounded; normal Telegram terminal errors produce a failed result.
 
 Stop it with `Ctrl+C`; Docker sends `SIGTERM` on normal container shutdown and the adapter closes SQLite gracefully.
 
