@@ -82,6 +82,11 @@ class Application:
 
     async def start(self) -> None:
         await self.storage.initialize()
+        recovered_count = await self.storage.recover_executing_membership_operations()
+        if recovered_count:
+            self._logger.warning(
+                "platform_membership_operations_recovered count=%s", recovered_count
+            )
         unknown_count = await self.storage.mark_executing_operations_unknown()
         if unknown_count:
             self._logger.error(
@@ -443,6 +448,19 @@ class Application:
             try:
                 result_payload = await self._execute_operation(operation)
             except TelegramOperationError as error:
+                if operation.operation_type == "get_chat_member" and (
+                    error.retryable or error.ambiguous
+                ):
+                    await self.storage.requeue_platform_operation(operation.operation_id)
+                    self._logger.warning(
+                        "platform_operation_retry operation_id=%s retry_in=%.0fs code=%s",
+                        operation.operation_id,
+                        delay,
+                        error.code,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, self._max_retry_delay)
+                    continue
                 if error.retryable and operation.attempt_count < 5:
                     await self.storage.requeue_platform_operation(operation.operation_id)
                     self._logger.warning(
@@ -467,7 +485,11 @@ class Application:
                     operation,
                     status="failed",
                     result={},
-                    error={"code": error.code},
+                    error={
+                        "code": error.code,
+                        "description": error.description,
+                        "retryable": error.retryable,
+                    },
                 )
             except Exception:
                 # An unexpected local failure has unknown action state, so never replay it automatically.
@@ -483,6 +505,8 @@ class Application:
             return await self._telegram_operations_client.send_message(operation.payload)
         if operation.operation_type == "delete_message":
             return await self._telegram_operations_client.delete_message(operation.payload)
+        if operation.operation_type == "get_chat_member":
+            return await self._telegram_operations_client.get_chat_member(operation.payload)
         raise TelegramOperationError("unsupported_operation")
 
     async def _complete_with_result(

@@ -22,9 +22,12 @@ class BootstrapUnused:
 
 
 class OperationsStub:
-    def __init__(self, *, send=None, delete=None) -> None:
+    def __init__(self, *, send=None, delete=None, membership=None) -> None:
         self.send = send if send is not None else {"telegram_chat_id": "1", "telegram_message_id": "2"}
         self.delete = delete if delete is not None else {"telegram_chat_id": "1", "telegram_message_id": "2", "deleted": True}
+        self.membership = membership if membership is not None else {
+            "chat_member": {"status": "member", "user": {"id": 42, "is_bot": False}}
+        }
         self.calls: list[str] = []
         self.closed = False
 
@@ -39,6 +42,12 @@ class OperationsStub:
         if isinstance(self.delete, Exception):
             raise self.delete
         return self.delete
+
+    async def get_chat_member(self, payload):
+        self.calls.append("get_chat_member")
+        if isinstance(self.membership, Exception):
+            raise self.membership
+        return self.membership
 
     async def close(self) -> None:
         self.closed = True
@@ -137,7 +146,11 @@ async def test_terminal_telegram_failure_persists_failed_result(tmp_path) -> Non
         raise AssertionError("missing result")
     assert pending[0].operation_id == operation_id
     assert pending[0].status == "failed"
-    assert pending[0].error == {"code": "chat_not_found"}
+    assert pending[0].error == {
+        "code": "chat_not_found",
+        "description": "Telegram operation failed",
+        "retryable": False,
+    }
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -182,6 +195,27 @@ async def test_ambiguous_executing_crash_is_not_replayed(tmp_path) -> None:
     assert await recovered.storage.mark_executing_operations_unknown() == 1
     assert (await recovered.storage.get_platform_operation(operation_id)).status == "execution_unknown"  # type: ignore[union-attr]
     assert await recovered.storage.claim_next_platform_operation() is None
+    await recovered.storage.close()
+
+
+@pytest.mark.asyncio
+async def test_executing_membership_lookup_is_requeued_after_restart(tmp_path) -> None:
+    first = await prepared_app(tmp_path, OperationsStub(), ResultsStub([]))
+    operation_id = await add_operation(
+        first,
+        "get_chat_member",
+        {"chat_id": "-100", "user_id": "42"},
+    )
+    assert (await first.storage.claim_next_platform_operation()).status == "executing"  # type: ignore[union-attr]
+    await first.storage.close()
+
+    recovered = await prepared_app(tmp_path, OperationsStub(), ResultsStub([]))
+    assert await recovered.storage.recover_executing_membership_operations() == 1
+    assert await recovered.storage.mark_executing_operations_unknown() == 0
+    claimed = await recovered.storage.claim_next_platform_operation()
+    assert claimed is not None
+    assert claimed.operation_id == operation_id
+    assert claimed.operation_type == "get_chat_member"
     await recovered.storage.close()
 
 
@@ -240,3 +274,104 @@ async def test_telegram_operations_client_does_not_expose_token_in_payloads() ->
     assert result == {"telegram_chat_id": "5", "telegram_message_id": "7"}
     assert "bot-secret" in str(requests[0].url)
     assert "bot-secret" not in requests[0].content.decode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    ["creator", "administrator", "member", "restricted", "left", "kicked"],
+)
+async def test_get_chat_member_returns_supported_raw_membership(status) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": {"status": status, "user": {"id": 42, "is_bot": False}},
+                },
+            )
+        )
+    ) as client:
+        result = await TelegramOperationsClient("bot-secret", client).get_chat_member(
+            {"chat_id": "-100", "user_id": "42"}
+        )
+
+    assert result["chat_member"]["status"] == status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [429, 500, 503])
+async def test_get_chat_member_temporary_failure_is_retryable(status_code) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                status_code, json={"ok": False, "description": "temporary"}
+            )
+        )
+    ) as client:
+        with pytest.raises(TelegramOperationError) as captured:
+            await TelegramOperationsClient("bot-secret", client).get_chat_member(
+                {"chat_id": "-100", "user_id": "42"}
+            )
+
+    assert captured.value.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_get_chat_member_network_failure_is_ambiguous_and_retryable() -> None:
+    def fail(request):
+        raise httpx.ConnectError("offline", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as client:
+        with pytest.raises(TelegramOperationError) as captured:
+            await TelegramOperationsClient("bot-secret", client).get_chat_member(
+                {"chat_id": "-100", "user_id": "42"}
+            )
+
+    assert captured.value.retryable is True
+    assert captured.value.ambiguous is True
+
+
+@pytest.mark.asyncio
+async def test_get_chat_member_invalid_chat_is_terminal() -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                400, json={"ok": False, "description": "Bad Request: chat not found"}
+            )
+        )
+    ) as client:
+        with pytest.raises(TelegramOperationError) as captured:
+            await TelegramOperationsClient("bot-secret", client).get_chat_member(
+                {"chat_id": "-100", "user_id": "42"}
+            )
+
+    assert captured.value.code == "chat_not_found"
+    assert captured.value.retryable is False
+    assert captured.value.ambiguous is False
+
+
+@pytest.mark.asyncio
+async def test_get_chat_member_retryable_failure_is_not_completed(tmp_path) -> None:
+    operations = OperationsStub(
+        membership=TelegramOperationError("rate_limited", retryable=True)
+    )
+    app = await prepared_app(tmp_path, operations, ResultsStub([]))
+    operation_id = await add_operation(
+        app,
+        "get_chat_member",
+        {"chat_id": "-100", "user_id": "42"},
+    )
+    task = asyncio.create_task(app._executor_loop())
+
+    await wait_for(lambda: operations.calls.count("get_chat_member") >= 2)
+    assert await app.storage.list_pending_results() == []
+    assert (await app.storage.get_platform_operation(operation_id)).status in {
+        "received",
+        "executing",
+    }
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await app.storage.close()

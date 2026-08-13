@@ -8,8 +8,16 @@ import httpx
 
 
 class TelegramOperationError(Exception):
-    def __init__(self, code: str, *, retryable: bool = False, ambiguous: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        description: str = "Telegram operation failed",
+        retryable: bool = False,
+        ambiguous: bool = False,
+    ) -> None:
         self.code = code
+        self.description = description[:255]
         self.retryable = retryable
         self.ambiguous = ambiguous
         super().__init__(code)
@@ -54,27 +62,83 @@ class TelegramOperationsClient:
                 raise
         return {"telegram_chat_id": str(chat_id), "telegram_message_id": str(message_id), "deleted": True}
 
+    async def get_chat_member(self, payload: dict[str, object]) -> dict[str, object]:
+        chat_id = _required_int(payload, "chat_id")
+        user_id = _required_int(payload, "user_id")
+        result = await self._call("getChatMember", {"chat_id": chat_id, "user_id": user_id})
+        if not isinstance(result, dict) or result.get("status") not in {
+            "creator",
+            "administrator",
+            "member",
+            "restricted",
+            "left",
+            "kicked",
+        }:
+            raise TelegramOperationError(
+                "telegram_invalid_response",
+                description="Telegram returned an invalid chat member",
+                retryable=True,
+                ambiguous=True,
+            )
+        user = result.get("user")
+        if not isinstance(user, dict) or user.get("id") != user_id:
+            raise TelegramOperationError(
+                "telegram_invalid_response",
+                description="Telegram returned a mismatched chat member",
+                retryable=True,
+                ambiguous=True,
+            )
+        return {"chat_member": result}
+
     async def _call(self, method: str, payload: dict[str, object]) -> object:
         try:
             response = await self._client.post(f"{self._base_url}/{method}", json=payload)
         except httpx.RequestError as error:
-            raise TelegramOperationError("telegram_transport_unknown", ambiguous=True) from error
+            raise TelegramOperationError(
+                "telegram_transport_unknown",
+                description="Telegram API transport failed",
+                retryable=True,
+                ambiguous=True,
+            ) from error
         try:
             body = response.json()
         except ValueError as error:
-            raise TelegramOperationError("telegram_invalid_response", ambiguous=True) from error
+            raise TelegramOperationError(
+                "telegram_invalid_response",
+                description="Telegram API returned invalid JSON",
+                retryable=True,
+                ambiguous=True,
+            ) from error
         if response.is_success and isinstance(body, dict) and body.get("ok") is True:
             return body.get("result")
         description = str(body.get("description", "")).lower() if isinstance(body, dict) else ""
         if response.status_code == 429:
-            raise TelegramOperationError("rate_limited", retryable=True)
+            raise TelegramOperationError(
+                "rate_limited", description=description or "Telegram rate limit", retryable=True
+            )
         if response.status_code >= 500:
-            raise TelegramOperationError("telegram_server_unknown", ambiguous=True)
+            raise TelegramOperationError(
+                "telegram_server_unknown",
+                description=description or "Telegram server error",
+                retryable=True,
+                ambiguous=True,
+            )
         if method == "deleteMessage" and "message to delete not found" in description:
             raise TelegramOperationError("already_absent")
         if method == "sendMessage" and "message to be replied not found" in description:
             raise TelegramOperationError("reply_target_missing")
-        raise TelegramOperationError("telegram_api_error")
+        if method == "getChatMember":
+            if "user not found" in description or "participant_id_invalid" in description:
+                raise TelegramOperationError("membership_not_found", description=description)
+            if "bot was kicked" in description or "bot is not a member" in description:
+                raise TelegramOperationError("bot_not_member", description=description)
+            if (
+                "chat not found" in description
+                or "chat was deleted" in description
+                or "group chat was deleted" in description
+            ):
+                raise TelegramOperationError("chat_not_found", description=description)
+        raise TelegramOperationError("telegram_api_error", description=description)
 
     async def close(self) -> None:
         if self._owns_client:

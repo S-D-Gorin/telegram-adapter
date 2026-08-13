@@ -484,6 +484,21 @@ class SQLiteStorage:
         connection.commit()
         return cursor.rowcount
 
+    async def recover_executing_membership_operations(self) -> int:
+        return await self._run(self._recover_executing_membership_operations_sync)
+
+    def _recover_executing_membership_operations_sync(self) -> int:
+        connection = self._require_connection()
+        cursor = connection.execute(
+            """
+            UPDATE platform_operations
+            SET status = 'received', execution_started_at = NULL
+            WHERE status = 'executing' AND operation_type = 'get_chat_member'
+            """
+        )
+        connection.commit()
+        return cursor.rowcount
+
     async def complete_operation_with_result(self, result: PendingResult) -> None:
         await self._run(self._complete_operation_with_result_sync, result)
 
