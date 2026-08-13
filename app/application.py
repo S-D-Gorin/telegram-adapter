@@ -93,12 +93,14 @@ class Application:
                 "platform_operation_execution_unknown count=%s; automatic Telegram replay is disabled", unknown_count
             )
         identity, created = await self.storage.get_or_create_identity()
-        register_secrets((identity.pairing_secret, identity.adapter_token, self.config.bot_token))
         self._started = True
         self._logger.info("adapter started", extra=self.config.safe_details())
         if created:
+            # This is the intentional, one-time user hand-off for bootstrap.
+            # Register the secret for redaction immediately afterwards.
             self._logger.warning("Adapter registration key: %s", identity.pairing_secret)
             self._logger.warning("Open Guardian and connect this adapter.")
+        register_secrets((identity.pairing_secret, identity.adapter_token, self.config.bot_token))
 
         if identity.adapter_token:
             await self.storage.update_pairing_status("active")

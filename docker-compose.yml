@@ -10,6 +10,14 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - telegram-adapter-data:/data
+    networks:
+      - default
+      - receiver-backend
 
 volumes:
   telegram-adapter-data:
+
+networks:
+  receiver-backend:
+    external: true
+    name: sprotect-v3_receiver-backend

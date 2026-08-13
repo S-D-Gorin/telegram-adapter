@@ -5,6 +5,7 @@ import pytest
 
 from app.application import Application
 from app.config import Config
+from app.logging import configure_logging
 from app.sprotect import PairingState, TokenAlreadyIssuedError, TransientBootstrapError
 
 
@@ -196,3 +197,23 @@ async def test_first_registration_key_and_secrets_are_not_written_after_startup(
     assert token not in caplog.text
     # The deliberate bootstrap-only registration message is the sole exception.
     assert caplog.text.count(identity.pairing_secret) == 1
+
+
+@pytest.mark.asyncio
+async def test_first_registration_key_is_visible_even_with_secret_redaction(tmp_path, caplog) -> None:
+    configure_logging("INFO", secrets=("telegram-secret",))
+    root = logging.getLogger()
+    root.addHandler(caplog.handler)
+    application = Application(
+        Config("https://api.sprotectbots.com", "telegram-secret", tmp_path, "INFO"),
+        bootstrap_client=BootstrapStub(["unpaired"]),  # type: ignore[arg-type]
+        initial_retry_delay=10,
+    )
+    try:
+        await application.start()
+        identity, _ = await application.storage.get_or_create_identity()
+    finally:
+        await application.stop()
+        root.removeHandler(caplog.handler)
+
+    assert f"Adapter registration key: {identity.pairing_secret}" in caplog.text
