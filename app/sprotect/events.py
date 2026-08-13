@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 import httpx
 
+from .urls import http_endpoint
+
 
 class PlatformEventError(Exception):
     """Base error that never includes Authorization or event payload values."""
@@ -25,7 +27,7 @@ class PlatformAuthenticationError(PermanentPlatformEventError):
 
 class SprotectPlatformEventsClient:
     def __init__(self, server_api: str, adapter_token: str, client: httpx.AsyncClient | None = None) -> None:
-        self._url = f"{server_api.rstrip('/')}/api/v1/platform/events/"
+        self._url = http_endpoint(server_api, "/api/v1/platform-adapters/events/")
         self._adapter_token = adapter_token
         self._client = client or httpx.AsyncClient(timeout=httpx.Timeout(10.0))
         self._owns_client = client is None

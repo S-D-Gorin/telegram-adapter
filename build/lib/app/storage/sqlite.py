@@ -73,13 +73,27 @@ class PendingResult:
         )
 
 
+@dataclass(frozen=True, repr=False)
+class PendingPlatformEvent:
+    event_id: str
+    telegram_update_id: int
+    envelope: dict[str, object]
+    delivery_status: str
+
+
 class SQLiteStorage:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
         self._connection: sqlite3.Connection | None = None
+        self._lock = asyncio.Lock()
+
+    async def _run(self, function, *args):
+        """Serialize one SQLite connection across the adapter's independent loops."""
+        async with self._lock:
+            return await asyncio.to_thread(function, *args)
 
     async def initialize(self) -> None:
-        await asyncio.to_thread(self._initialize_sync)
+        await self._run(self._initialize_sync)
 
     def _initialize_sync(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,6 +137,16 @@ class SQLiteStorage:
                 CREATE TABLE IF NOT EXISTS telegram_update_state (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     next_update_id INTEGER
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_platform_events (
+                    event_id TEXT PRIMARY KEY,
+                    telegram_update_id INTEGER NOT NULL UNIQUE,
+                    envelope_json TEXT NOT NULL,
+                    delivery_status TEXT NOT NULL CHECK (delivery_status IN ('pending', 'delivered'))
                 )
                 """
             )
@@ -188,7 +212,7 @@ class SQLiteStorage:
             )
 
     async def get_or_create_identity(self) -> tuple[AdapterIdentity, bool]:
-        return await asyncio.to_thread(self._get_or_create_identity_sync)
+        return await self._run(self._get_or_create_identity_sync)
 
     def _get_or_create_identity_sync(self) -> tuple[AdapterIdentity, bool]:
         connection = self._require_connection()
@@ -218,7 +242,7 @@ class SQLiteStorage:
         return identity, True
 
     async def update_pairing_status(self, status: str) -> AdapterIdentity:
-        return await asyncio.to_thread(self._update_pairing_status_sync, status)
+        return await self._run(self._update_pairing_status_sync, status)
 
     def _update_pairing_status_sync(self, status: str) -> AdapterIdentity:
         connection = self._require_connection()
@@ -229,7 +253,7 @@ class SQLiteStorage:
         return self._load_identity(connection)
 
     async def activate_identity(self, adapter_token: str) -> AdapterIdentity:
-        return await asyncio.to_thread(self._activate_identity_sync, adapter_token)
+        return await self._run(self._activate_identity_sync, adapter_token)
 
     def _activate_identity_sync(self, adapter_token: str) -> AdapterIdentity:
         connection = self._require_connection()
@@ -246,7 +270,7 @@ class SQLiteStorage:
         return self._load_identity(connection)
 
     async def get_telegram_offset(self) -> int | None:
-        return await asyncio.to_thread(self._get_telegram_offset_sync)
+        return await self._run(self._get_telegram_offset_sync)
 
     def _get_telegram_offset_sync(self) -> int | None:
         row = self._require_connection().execute(
@@ -255,7 +279,7 @@ class SQLiteStorage:
         return int(row[0]) if row is not None and row[0] is not None else None
 
     async def advance_telegram_offset(self, next_update_id: int) -> None:
-        await asyncio.to_thread(self._advance_telegram_offset_sync, next_update_id)
+        await self._run(self._advance_telegram_offset_sync, next_update_id)
 
     def _advance_telegram_offset_sync(self, next_update_id: int) -> None:
         connection = self._require_connection()
@@ -268,12 +292,76 @@ class SQLiteStorage:
         )
         connection.commit()
 
+    async def store_platform_event(self, event_id: str, telegram_update_id: int, envelope: dict[str, object]) -> PendingPlatformEvent:
+        return await self._run(self._store_platform_event_sync, event_id, telegram_update_id, envelope)
+
+    def _store_platform_event_sync(
+        self, event_id: str, telegram_update_id: int, envelope: dict[str, object]
+    ) -> PendingPlatformEvent:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT event_id, telegram_update_id, envelope_json, delivery_status FROM pending_platform_events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            envelope_json = _canonical_json(envelope)
+            connection.execute(
+                """
+                INSERT INTO pending_platform_events (event_id, telegram_update_id, envelope_json, delivery_status)
+                VALUES (?, ?, ?, 'pending')
+                """,
+                (event_id, telegram_update_id, envelope_json),
+            )
+            connection.commit()
+            return PendingPlatformEvent(event_id, telegram_update_id, envelope, "pending")
+        stored = json.loads(row[2])
+        assert isinstance(stored, dict)
+        return PendingPlatformEvent(str(row[0]), int(row[1]), stored, str(row[3]))
+
+    async def list_pending_platform_events(self) -> list[PendingPlatformEvent]:
+        return await self._run(self._list_pending_platform_events_sync)
+
+    def _list_pending_platform_events_sync(self) -> list[PendingPlatformEvent]:
+        rows = self._require_connection().execute(
+            """
+            SELECT event_id, telegram_update_id, envelope_json, delivery_status
+            FROM pending_platform_events WHERE delivery_status = 'pending' ORDER BY telegram_update_id
+            """
+        ).fetchall()
+        return [
+            PendingPlatformEvent(str(row[0]), int(row[1]), json.loads(row[2]), str(row[3]))
+            for row in rows
+        ]
+
+    async def mark_event_delivered_and_advance_offset(self, event_id: str, next_update_id: int) -> None:
+        await self._run(self._mark_event_delivered_and_advance_offset_sync, event_id, next_update_id)
+
+    def _mark_event_delivered_and_advance_offset_sync(self, event_id: str, next_update_id: int) -> None:
+        connection = self._require_connection()
+        connection.execute("BEGIN")
+        try:
+            connection.execute(
+                "UPDATE pending_platform_events SET delivery_status = 'delivered' WHERE event_id = ?",
+                (event_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO telegram_update_state (singleton, next_update_id) VALUES (1, ?)
+                ON CONFLICT(singleton) DO UPDATE SET next_update_id = MAX(next_update_id, excluded.next_update_id)
+                """,
+                (next_update_id,),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
     async def store_platform_operation(self, operation: PlatformOperation) -> str:
         """Durably store an immutable operation before an ACK is sent.
 
         Returns ``new``, ``duplicate``, or ``conflict`` for a reused operation ID.
         """
-        return await asyncio.to_thread(self._store_platform_operation_sync, operation)
+        return await self._run(self._store_platform_operation_sync, operation)
 
     def _store_platform_operation_sync(self, operation: PlatformOperation) -> str:
         connection = self._require_connection()
@@ -314,7 +402,7 @@ class SQLiteStorage:
         return "new"
 
     async def get_platform_operation(self, operation_id: str) -> PlatformOperation | None:
-        return await asyncio.to_thread(self._get_platform_operation_sync, operation_id)
+        return await self._run(self._get_platform_operation_sync, operation_id)
 
     def _get_platform_operation_sync(self, operation_id: str) -> PlatformOperation | None:
         row = self._require_connection().execute(
@@ -340,7 +428,7 @@ class SQLiteStorage:
         )
 
     async def claim_next_platform_operation(self) -> PlatformOperation | None:
-        return await asyncio.to_thread(self._claim_next_platform_operation_sync)
+        return await self._run(self._claim_next_platform_operation_sync)
 
     def _claim_next_platform_operation_sync(self) -> PlatformOperation | None:
         connection = self._require_connection()
@@ -369,7 +457,7 @@ class SQLiteStorage:
         )
 
     async def requeue_platform_operation(self, operation_id: str) -> None:
-        await asyncio.to_thread(self._requeue_platform_operation_sync, operation_id)
+        await self._run(self._requeue_platform_operation_sync, operation_id)
 
     def _requeue_platform_operation_sync(self, operation_id: str) -> None:
         connection = self._require_connection()
@@ -383,7 +471,7 @@ class SQLiteStorage:
         connection.commit()
 
     async def mark_executing_operations_unknown(self) -> int:
-        return await asyncio.to_thread(self._mark_executing_operations_unknown_sync)
+        return await self._run(self._mark_executing_operations_unknown_sync)
 
     def _mark_executing_operations_unknown_sync(self) -> int:
         connection = self._require_connection()
@@ -397,7 +485,7 @@ class SQLiteStorage:
         return cursor.rowcount
 
     async def complete_operation_with_result(self, result: PendingResult) -> None:
-        await asyncio.to_thread(self._complete_operation_with_result_sync, result)
+        await self._run(self._complete_operation_with_result_sync, result)
 
     def _complete_operation_with_result_sync(self, result: PendingResult) -> None:
         connection = self._require_connection()
@@ -430,7 +518,7 @@ class SQLiteStorage:
             raise
 
     async def list_pending_results(self) -> list[PendingResult]:
-        return await asyncio.to_thread(self._list_pending_results_sync)
+        return await self._run(self._list_pending_results_sync)
 
     def _list_pending_results_sync(self) -> list[PendingResult]:
         rows = self._require_connection().execute(
@@ -443,7 +531,7 @@ class SQLiteStorage:
         return [self._pending_result_from_row(row) for row in rows]
 
     async def mark_result_delivered(self, result_id: str) -> None:
-        await asyncio.to_thread(self._mark_result_delivered_sync, result_id)
+        await self._run(self._mark_result_delivered_sync, result_id)
 
     def _mark_result_delivered_sync(self, result_id: str) -> None:
         connection = self._require_connection()
@@ -488,7 +576,7 @@ class SQLiteStorage:
     async def close(self) -> None:
         if self._connection is not None:
             connection, self._connection = self._connection, None
-            await asyncio.to_thread(connection.close)
+            await self._run(connection.close)
 
 
 def _utc_now() -> str:

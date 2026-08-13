@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from .urls import http_endpoint
+
 
 class BootstrapError(Exception):
     """Base exception for bootstrap failures that contain no secret values."""
@@ -38,7 +40,7 @@ class PairingState:
 
 class SprotectBootstrapClient:
     def __init__(self, server_api: str, client: httpx.AsyncClient | None = None) -> None:
-        self._base_url = server_api.rstrip("/")
+        self._server_api = server_api
         self._client = client or httpx.AsyncClient(timeout=httpx.Timeout(10.0))
         self._owns_client = client is None
 
@@ -83,7 +85,7 @@ class SprotectBootstrapClient:
             request_body["platform"] = platform
         try:
             response = await self._client.post(
-                f"{self._base_url}{path}",
+                http_endpoint(self._server_api, path),
                 json=request_body,
             )
         except httpx.RequestError as error:

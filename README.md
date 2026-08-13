@@ -24,7 +24,7 @@ docker compose up --build
 
 On its first startup, the adapter prints a one-time **Adapter registration key**. Open Guardian as the Organization owner and connect the adapter using this key. The running adapter polls the bootstrap status with exponential backoff; once pairing is confirmed it obtains and durably stores its adapter token, logs `adapter ready`, and starts Telegram long polling.
 
-Each raw Telegram Update is sent sequentially to `POST /api/v1/platform/events/` in this envelope:
+Each raw Telegram Update is sent sequentially to `POST /api/v1/platform-adapters/events/` in this envelope:
 
 ```json
 {
@@ -37,11 +37,15 @@ Each raw Telegram Update is sent sequentially to `POST /api/v1/platform/events/`
 }
 ```
 
-The durable Telegram offset advances only after Sprotect returns `202 accepted` or `200 duplicate`. On first use no offset is sent to Telegram, so pending updates are delivered rather than silently discarded. Temporary backend failures retain the offset and retry the same stable event ID; rejected events and revoked credentials enter a visible degraded state without losing the update. A Telegram `409` means another polling instance is active and is retried slowly.
+The adapter uses the following paths derived from `SERVER_API`: bootstrap under `/api/v1/platform-adapters/bootstrap/`, events at `/api/v1/platform-adapters/events/`, results at `/api/v1/platform-adapters/results/`, and commands at `/api/v1/platform-adapters/commands/ws/`. A trailing slash in `SERVER_API` is safe; HTTPS automatically maps the command URL to `wss://`.
+
+The raw event envelope is first persisted in SQLite with its stable `telegram:<update_id>` ID. The durable Telegram offset advances only after Sprotect returns `202 accepted` or `200 duplicate`. Temporary backend failures, including `5xx`, retain that local event and retry its unchanged envelope; rejected events and revoked credentials enter a visible degraded state without losing the update. A Telegram `409` means another polling instance is active and is retried slowly.
 
 The adapter creates its durable local SQLite database at `/data/adapter.db`. Compose persists it in the `telegram-adapter-data` named volume. The volume includes the installation identity, pairing secret, and adapter token, so it must be retained when moving the adapter to another server. Losing it creates a new installation that must be paired again. If the server has already issued a one-time token but the local durable write was lost, the token cannot be recovered under the bootstrap security contract.
 
 The Docker healthcheck verifies that this initialized database remains readable; no HTTP server is started for health checks. `BOT_TOKEN` remains only inside the adapter and is used only for Telegram Bot API; RabbitMQ is not required by this container.
+
+Runtime logs include a safe readiness snapshot: `bootstrap_ready`, `telegram_polling_ready`, `platform_events_ready`, and `platform_commands_ready`. Process liveness alone does not mean every transport is connected.
 
 ## WebSocket operation receipt
 

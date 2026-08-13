@@ -107,7 +107,12 @@ async def test_send_and_delete_success_create_durable_results_then_deliver(tmp_p
     assert operations.calls == ["send_message", "delete_message"]
     assert [item.operation_id for item in results.results] == [send_id, delete_id]
     assert all(item.status == "succeeded" for item in results.results)
-    assert await app.storage.list_pending_results() == []
+    for _ in range(150):
+        if not await app.storage.list_pending_results():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("results were not marked delivered")
     for task in (app._executor_task, app._result_delivery_task):
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

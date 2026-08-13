@@ -9,6 +9,7 @@ from app.sprotect import (
     TokenAlreadyIssuedError,
     TransientBootstrapError,
 )
+from app.sprotect.urls import http_endpoint, websocket_endpoint
 
 
 @pytest.mark.asyncio
@@ -68,3 +69,22 @@ async def test_client_handles_one_time_token_recovery_semantics() -> None:
     ) as transport:
         with pytest.raises(TokenAlreadyIssuedError):
             await SprotectBootstrapClient("https://backend.example", transport).obtain_token("id", "secret")
+
+
+@pytest.mark.parametrize("server_api", ["http://backend:8000", "http://backend:8000/"])
+def test_http_endpoint_mapping_avoids_double_slashes(server_api: str) -> None:
+    assert http_endpoint(server_api, "/api/v1/platform-adapters/events/") == (
+        "http://backend:8000/api/v1/platform-adapters/events/"
+    )
+    assert http_endpoint(server_api, "/api/v1/platform-adapters/results/") == (
+        "http://backend:8000/api/v1/platform-adapters/results/"
+    )
+
+
+def test_websocket_endpoint_mapping_converts_http_and_https() -> None:
+    assert websocket_endpoint("http://backend:8000/", "/api/v1/platform-adapters/commands/ws/") == (
+        "ws://backend:8000/api/v1/platform-adapters/commands/ws/"
+    )
+    assert websocket_endpoint("https://backend.example", "/api/v1/platform-adapters/commands/ws/") == (
+        "wss://backend.example/api/v1/platform-adapters/commands/ws/"
+    )

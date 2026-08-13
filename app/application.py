@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.config import Config
+from app.logging import register_secrets
 from app.sprotect import (
     PermanentBootstrapError,
     SprotectBootstrapClient,
@@ -27,7 +28,7 @@ from app.sprotect import (
     SprotectPlatformResultsClient,
     TransientResultDeliveryError,
 )
-from app.storage import AdapterIdentity, PendingResult, PlatformOperation, SQLiteStorage
+from app.storage import AdapterIdentity, PendingPlatformEvent, PendingResult, PlatformOperation, SQLiteStorage
 from app.telegram import (
     PermanentTelegramError,
     TelegramBotClient,
@@ -70,6 +71,12 @@ class Application:
         self._commands_task: asyncio.Task[None] | None = None
         self._executor_task: asyncio.Task[None] | None = None
         self._result_delivery_task: asyncio.Task[None] | None = None
+        self._transport_states = {
+            "bootstrap_ready": False,
+            "telegram_polling_ready": False,
+            "platform_events_ready": False,
+            "platform_commands_ready": False,
+        }
         self._started = False
         self._logger = logging.getLogger(__name__)
 
@@ -81,6 +88,7 @@ class Application:
                 "platform_operation_execution_unknown count=%s; automatic Telegram replay is disabled", unknown_count
             )
         identity, created = await self.storage.get_or_create_identity()
+        register_secrets((identity.pairing_secret, identity.adapter_token, self.config.bot_token))
         self._started = True
         self._logger.info("adapter started", extra=self.config.safe_details())
         if created:
@@ -174,6 +182,25 @@ class Application:
 
     def _log_ready(self, identity: AdapterIdentity) -> None:
         self._logger.info("adapter ready platform=telegram adapter_id=%s", identity.adapter_id)
+        self._set_transport_state("bootstrap_ready", True)
+
+    @property
+    def readiness(self) -> dict[str, bool]:
+        """Safe operational snapshot; no secrets or payloads."""
+        return dict(self._transport_states)
+
+    def _set_transport_state(self, name: str, value: bool) -> None:
+        if self._transport_states[name] == value:
+            return
+        self._transport_states[name] = value
+        self._logger.info(
+            "adapter_transport_state bootstrap_ready=%s telegram_polling_ready=%s "
+            "platform_events_ready=%s platform_commands_ready=%s",
+            self._transport_states["bootstrap_ready"],
+            self._transport_states["telegram_polling_ready"],
+            self._transport_states["platform_events_ready"],
+            self._transport_states["platform_commands_ready"],
+        )
 
     def _start_polling(self, identity: AdapterIdentity) -> None:
         if self._polling_task is not None or identity.adapter_token is None:
@@ -216,24 +243,35 @@ class Application:
         delay = self._initial_retry_delay
         self._logger.info("telegram_polling_started adapter_id=%s", adapter_id)
         while True:
+            pending_events = await self.storage.list_pending_platform_events()
+            if pending_events:
+                if not await self._deliver_pending_event(pending_events[0], delay):
+                    delay = min(delay * 2, self._max_retry_delay)
+                    continue
+                delay = self._initial_retry_delay
+                continue
             offset = await self.storage.get_telegram_offset()
             try:
                 updates = await self._telegram_client.get_updates(offset)
             except TelegramPollingConflictError:
+                self._set_transport_state("telegram_polling_ready", False)
                 self._logger.error("telegram_polling_conflict another Telegram polling instance is active")
                 await asyncio.sleep(self._max_retry_delay)
                 continue
             except TransientTelegramError as error:
+                self._set_transport_state("telegram_polling_ready", False)
                 self._logger.warning("telegram polling temporary failure; retrying in %.0fs: %s", delay, error)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self._max_retry_delay)
                 continue
             except PermanentTelegramError as error:
+                self._set_transport_state("telegram_polling_ready", False)
                 self._logger.error("telegram polling degraded: %s", error)
                 await asyncio.sleep(self._max_retry_delay)
                 continue
 
             delay = self._initial_retry_delay
+            self._set_transport_state("telegram_polling_ready", True)
             delivered_all = True
             for update in sorted(updates, key=lambda item: item.get("update_id", -1)):
                 update_id = update.get("update_id")
@@ -252,41 +290,61 @@ class Application:
                     "occurred_at": _occurred_at(),
                     "payload": update,
                 }
+                pending_event = await self.storage.store_platform_event(event_id, update_id, event)
                 self._logger.info("telegram_update_received telegram_update_id=%s event_id=%s", update_id, event_id)
-                try:
-                    outcome = await self._platform_events_client.deliver(event)
-                except TransientPlatformEventError as error:
-                    self._logger.warning(
-                        "platform_event_retry telegram_update_id=%s event_id=%s retry_in=%.0fs: %s",
-                        update_id,
-                        event_id,
-                        delay,
-                        error,
-                    )
-                    await asyncio.sleep(delay)
+                if not await self._deliver_pending_event(pending_event, delay):
                     delay = min(delay * 2, self._max_retry_delay)
                     delivered_all = False
                     break
-                except PlatformAuthenticationError as error:
-                    self._logger.error("platform events authentication degraded: %s", error)
-                    await asyncio.sleep(self._max_retry_delay)
-                    delivered_all = False
-                    break
-                except PermanentPlatformEventError as error:
-                    self._logger.error(
-                        "platform event permanently rejected; retaining telegram_update_id=%s: %s", update_id, error
-                    )
-                    await asyncio.sleep(self._max_retry_delay)
-                    delivered_all = False
-                    break
-
-                await self.storage.advance_telegram_offset(update_id + 1)
-                if outcome == "accepted":
-                    self._logger.info("platform_event_delivered telegram_update_id=%s event_id=%s", update_id, event_id)
-                else:
-                    self._logger.info("platform_event_duplicate telegram_update_id=%s event_id=%s", update_id, event_id)
             if not delivered_all:
                 continue
+
+    async def _deliver_pending_event(self, pending_event: PendingPlatformEvent, delay: float) -> bool:
+        assert self._platform_events_client is not None
+        try:
+            outcome = await self._platform_events_client.deliver(pending_event.envelope)
+        except TransientPlatformEventError as error:
+            self._set_transport_state("platform_events_ready", False)
+            self._logger.warning(
+                "platform_event_retry telegram_update_id=%s event_id=%s retry_in=%.0fs: %s",
+                pending_event.telegram_update_id,
+                pending_event.event_id,
+                delay,
+                error,
+            )
+            await asyncio.sleep(delay)
+            return False
+        except PlatformAuthenticationError as error:
+            self._set_transport_state("platform_events_ready", False)
+            self._logger.error("platform events authentication degraded: %s", error)
+            await asyncio.sleep(self._max_retry_delay)
+            return False
+        except PermanentPlatformEventError as error:
+            self._set_transport_state("platform_events_ready", False)
+            self._logger.error(
+                "platform event permanently rejected; retaining telegram_update_id=%s: %s",
+                pending_event.telegram_update_id,
+                error,
+            )
+            await asyncio.sleep(self._max_retry_delay)
+            return False
+        await self.storage.mark_event_delivered_and_advance_offset(
+            pending_event.event_id, pending_event.telegram_update_id + 1
+        )
+        self._set_transport_state("platform_events_ready", True)
+        if outcome == "accepted":
+            self._logger.info(
+                "platform_event_delivered telegram_update_id=%s event_id=%s",
+                pending_event.telegram_update_id,
+                pending_event.event_id,
+            )
+        else:
+            self._logger.info(
+                "platform_event_duplicate telegram_update_id=%s event_id=%s",
+                pending_event.telegram_update_id,
+                pending_event.event_id,
+            )
+        return True
 
     async def _commands_loop(self, adapter_id: str) -> None:
         assert self._platform_commands_client is not None
@@ -296,13 +354,16 @@ class Application:
             try:
                 connection = await self._platform_commands_client.connect()
                 self._logger.info("platform_commands_connected adapter_id=%s", adapter_id)
+                self._set_transport_state("platform_commands_ready", True)
                 delay = self._initial_retry_delay
                 while True:
                     await self._handle_command_frame(connection, await connection.recv())
             except CommandAuthenticationError as error:
+                self._set_transport_state("platform_commands_ready", False)
                 self._logger.error("platform commands authentication degraded: %s", error)
                 await asyncio.sleep(self._max_retry_delay)
             except ConnectionClosed as error:
+                self._set_transport_state("platform_commands_ready", False)
                 if is_authentication_close(error):
                     self._logger.error("platform commands authentication degraded: WebSocket closed with 4401")
                     await asyncio.sleep(self._max_retry_delay)
@@ -311,7 +372,13 @@ class Application:
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, self._max_retry_delay)
             except CommandTransportError as error:
-                self._logger.warning("platform commands unavailable; retrying in %.0fs: %s", delay, error)
+                self._set_transport_state("platform_commands_ready", False)
+                self._logger.warning(
+                    "platform_command_websocket_handshake_failed url=%s http_status=%s retry_in_seconds=%.0f",
+                    error.url or "unavailable",
+                    error.http_status if error.http_status is not None else "unavailable",
+                    delay,
+                )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self._max_retry_delay)
             finally:

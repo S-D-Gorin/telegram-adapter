@@ -13,7 +13,7 @@ from app.logging import configure_logging
 
 async def run() -> None:
     config = load_config()
-    configure_logging(config.log_level)
+    configure_logging(config.log_level, secrets=(config.bot_token,))
     application = Application(config)
     stop_requested = asyncio.Event()
     loop = asyncio.get_running_loop()

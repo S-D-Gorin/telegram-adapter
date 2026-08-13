@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from urllib.parse import urlsplit, urlunsplit
-
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 
 
 class CommandTransportError(Exception):
     """Reconnectable WebSocket transport failure without credential details."""
+
+    def __init__(self, message: str, *, url: str | None = None, http_status: int | None = None) -> None:
+        self.url = url
+        self.http_status = http_status
+        super().__init__(message)
 
 
 class CommandAuthenticationError(Exception):
@@ -18,14 +21,7 @@ class CommandAuthenticationError(Exception):
 
 class PlatformCommandsWebSocketClient:
     def __init__(self, server_api: str, adapter_token: str) -> None:
-        parsed = urlsplit(server_api)
-        scheme = {"http": "ws", "https": "wss"}.get(parsed.scheme)
-        if scheme is None:
-            raise ValueError("SERVER_API must use http(s)")
-        base_path = parsed.path.rstrip("/")
-        self._url = urlunsplit(
-            (scheme, parsed.netloc, f"{base_path}/api/v1/platform-adapters/commands/ws/", "", "")
-        )
+        self._url = websocket_endpoint(server_api, "/api/v1/platform-adapters/commands/ws/")
         self._adapter_token = adapter_token
 
     async def connect(self):
@@ -39,12 +35,17 @@ class PlatformCommandsWebSocketClient:
         except InvalidStatus as error:
             if error.response.status_code in {401, 403}:
                 raise CommandAuthenticationError("platform command authentication was rejected") from error
-            raise CommandTransportError("platform command WebSocket handshake failed") from error
+            raise CommandTransportError(
+                "platform command WebSocket handshake failed",
+                url=self._url,
+                http_status=error.response.status_code,
+            ) from error
         except InvalidHandshake as error:
-            raise CommandTransportError("platform command WebSocket handshake failed") from error
+            raise CommandTransportError("platform command WebSocket handshake failed", url=self._url) from error
         except OSError as error:
-            raise CommandTransportError("unable to reach platform command WebSocket") from error
+            raise CommandTransportError("unable to reach platform command WebSocket", url=self._url) from error
 
 
 def is_authentication_close(error: ConnectionClosed) -> bool:
     return error.code == 4401
+from .urls import websocket_endpoint

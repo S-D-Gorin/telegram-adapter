@@ -8,6 +8,8 @@ import httpx
 
 from app.storage import PendingResult
 
+from .urls import http_endpoint
+
 
 class ResultDeliveryError(Exception):
     pass
@@ -23,7 +25,7 @@ class PermanentResultDeliveryError(ResultDeliveryError):
 
 class SprotectPlatformResultsClient:
     def __init__(self, server_api: str, adapter_token: str, client: httpx.AsyncClient | None = None) -> None:
-        self._url = f"{server_api.rstrip('/')}/api/v1/platform-adapters/results/"
+        self._url = http_endpoint(server_api, "/api/v1/platform-adapters/results/")
         self._adapter_token = adapter_token
         self._client = client or httpx.AsyncClient(timeout=httpx.Timeout(10.0))
         self._owns_client = client is None

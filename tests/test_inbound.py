@@ -173,7 +173,10 @@ async def test_timeout_or_5xx_style_failure_retains_offset_then_retries(tmp_path
 
     await application.start()
     await wait_for(lambda: len(events.events) == 2)
-    assert telegram.offsets[:2] == [None, None]
+    # The raw event is now durable locally, so retry does not depend on another Telegram fetch.
+    assert telegram.offsets[:1] == [None]
+    assert events.events[0]["event_id"] == events.events[1]["event_id"] == "telegram:20"
+    assert events.events[0]["occurred_at"] == events.events[1]["occurred_at"]
     assert await application.storage.get_telegram_offset() == 21
     await application.stop()
 
@@ -188,6 +191,8 @@ async def test_permanent_rejection_retains_offset(tmp_path) -> None:
     await application.start()
     await wait_for(lambda: len(events.events) == 1)
     assert await application.storage.get_telegram_offset() is None
+    pending = await application.storage.list_pending_platform_events()
+    assert pending[0].event_id == "telegram:30"
     await application.stop()
 
 
@@ -246,4 +251,5 @@ async def test_http_clients_keep_bot_token_and_adapter_token_on_their_own_bounda
     assert telegram_requests[0].headers.get("Authorization") is None
     assert "bot-secret" not in backend_requests[0].content.decode()
     assert backend_requests[0].headers["Authorization"] == "Bearer adapter-secret"
+    assert backend_requests[0].url.path == "/api/v1/platform-adapters/events/"
     assert json.loads(backend_requests[0].content)["payload"] == update(1)
