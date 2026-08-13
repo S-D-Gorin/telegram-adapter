@@ -59,6 +59,14 @@ class SQLiteStorage:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS telegram_update_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    next_update_id INTEGER
+                )
+                """
+            )
             connection.commit()
             self.database_path.chmod(0o600)
         except BaseException:
@@ -123,6 +131,29 @@ class SQLiteStorage:
         )
         connection.commit()
         return self._load_identity(connection)
+
+    async def get_telegram_offset(self) -> int | None:
+        return await asyncio.to_thread(self._get_telegram_offset_sync)
+
+    def _get_telegram_offset_sync(self) -> int | None:
+        row = self._require_connection().execute(
+            "SELECT next_update_id FROM telegram_update_state WHERE singleton = 1"
+        ).fetchone()
+        return int(row[0]) if row is not None and row[0] is not None else None
+
+    async def advance_telegram_offset(self, next_update_id: int) -> None:
+        await asyncio.to_thread(self._advance_telegram_offset_sync, next_update_id)
+
+    def _advance_telegram_offset_sync(self, next_update_id: int) -> None:
+        connection = self._require_connection()
+        connection.execute(
+            """
+            INSERT INTO telegram_update_state (singleton, next_update_id) VALUES (1, ?)
+            ON CONFLICT(singleton) DO UPDATE SET next_update_id = MAX(next_update_id, excluded.next_update_id)
+            """,
+            (next_update_id,),
+        )
+        connection.commit()
 
     def _load_identity(self, connection: sqlite3.Connection) -> AdapterIdentity:
         row = connection.execute("SELECT * FROM adapter_identity WHERE singleton = 1").fetchone()

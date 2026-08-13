@@ -8,6 +8,12 @@ from .client import (
     TokenAlreadyIssuedError,
     TransientBootstrapError,
 )
+from .events import (
+    PermanentPlatformEventError,
+    PlatformAuthenticationError,
+    SprotectPlatformEventsClient,
+    TransientPlatformEventError,
+)
 
 __all__ = [
     "BootstrapError",
@@ -16,4 +22,8 @@ __all__ = [
     "SprotectBootstrapClient",
     "TokenAlreadyIssuedError",
     "TransientBootstrapError",
+    "PermanentPlatformEventError",
+    "PlatformAuthenticationError",
+    "SprotectPlatformEventsClient",
+    "TransientPlatformEventError",
 ]

@@ -4,15 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
+from typing import Any
 
 from app.config import Config
 from app.sprotect import (
     PermanentBootstrapError,
     SprotectBootstrapClient,
+    SprotectPlatformEventsClient,
     TokenAlreadyIssuedError,
     TransientBootstrapError,
+    TransientPlatformEventError,
+    PermanentPlatformEventError,
+    PlatformAuthenticationError,
 )
 from app.storage import AdapterIdentity, SQLiteStorage
+from app.telegram import (
+    PermanentTelegramError,
+    TelegramBotClient,
+    TelegramPollingConflictError,
+    TransientTelegramError,
+)
 
 
 class Application:
@@ -23,15 +35,20 @@ class Application:
         config: Config,
         *,
         bootstrap_client: SprotectBootstrapClient | None = None,
+        telegram_client: TelegramBotClient | None = None,
+        platform_events_client: SprotectPlatformEventsClient | None = None,
         initial_retry_delay: float = 2.0,
         max_retry_delay: float = 60.0,
     ) -> None:
         self.config = config
         self.storage = SQLiteStorage(config.database_path)
         self._client = bootstrap_client or SprotectBootstrapClient(config.server_api)
+        self._telegram_client = telegram_client
+        self._platform_events_client = platform_events_client
         self._initial_retry_delay = initial_retry_delay
         self._max_retry_delay = max_retry_delay
         self._pairing_task: asyncio.Task[None] | None = None
+        self._polling_task: asyncio.Task[None] | None = None
         self._started = False
         self._logger = logging.getLogger(__name__)
 
@@ -47,6 +64,7 @@ class Application:
         if identity.adapter_token:
             await self.storage.update_pairing_status("active")
             self._log_ready(identity)
+            self._start_polling(identity)
             return
         if identity.pairing_status == "token_unrecoverable":
             self._logger.error(
@@ -58,13 +76,20 @@ class Application:
     async def stop(self) -> None:
         if not self._started:
             return
-        if self._pairing_task is not None:
-            self._pairing_task.cancel()
+        for task_name in ("_polling_task", "_pairing_task"):
+            task = getattr(self, task_name)
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._pairing_task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._pairing_task = None
+            setattr(self, task_name, None)
+        if self._telegram_client is not None:
+            await self._telegram_client.close()
+        if self._platform_events_client is not None:
+            await self._platform_events_client.close()
         await self._client.close()
         await self.storage.close()
         self._started = False
@@ -84,7 +109,7 @@ class Application:
                     await asyncio.sleep(self._max_retry_delay)
                     continue
                 if not state.is_active:
-                    self._logger.info("adapter awaiting Guardian pairing", extra={"adapter_id": identity.adapter_id})
+                    self._logger.info("adapter awaiting Guardian pairing adapter_id=%s", identity.adapter_id)
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, self._max_retry_delay)
                     continue
@@ -92,6 +117,7 @@ class Application:
                 token = await self._client.obtain_token(identity.adapter_id, identity.pairing_secret)
                 identity = await self.storage.activate_identity(token)
                 self._log_ready(identity)
+                self._start_polling(identity)
                 return
             except TokenAlreadyIssuedError:
                 await self.storage.update_pairing_status("token_unrecoverable")
@@ -107,7 +133,95 @@ class Application:
             delay = min(delay * 2, self._max_retry_delay)
 
     def _log_ready(self, identity: AdapterIdentity) -> None:
-        self._logger.info(
-            "adapter ready",
-            extra={"platform": "telegram", "adapter_id": identity.adapter_id},
+        self._logger.info("adapter ready platform=telegram adapter_id=%s", identity.adapter_id)
+
+    def _start_polling(self, identity: AdapterIdentity) -> None:
+        if self._polling_task is not None or identity.adapter_token is None:
+            return
+        self._telegram_client = self._telegram_client or TelegramBotClient(self.config.bot_token)
+        self._platform_events_client = self._platform_events_client or SprotectPlatformEventsClient(
+            self.config.server_api, identity.adapter_token
         )
+        self._polling_task = asyncio.create_task(self._polling_loop(identity.adapter_id), name="telegram-polling")
+
+    async def _polling_loop(self, adapter_id: str) -> None:
+        assert self._telegram_client is not None
+        assert self._platform_events_client is not None
+        delay = self._initial_retry_delay
+        self._logger.info("telegram_polling_started adapter_id=%s", adapter_id)
+        while True:
+            offset = await self.storage.get_telegram_offset()
+            try:
+                updates = await self._telegram_client.get_updates(offset)
+            except TelegramPollingConflictError:
+                self._logger.error("telegram_polling_conflict another Telegram polling instance is active")
+                await asyncio.sleep(self._max_retry_delay)
+                continue
+            except TransientTelegramError as error:
+                self._logger.warning("telegram polling temporary failure; retrying in %.0fs: %s", delay, error)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._max_retry_delay)
+                continue
+            except PermanentTelegramError as error:
+                self._logger.error("telegram polling degraded: %s", error)
+                await asyncio.sleep(self._max_retry_delay)
+                continue
+
+            delay = self._initial_retry_delay
+            delivered_all = True
+            for update in sorted(updates, key=lambda item: item.get("update_id", -1)):
+                update_id = update.get("update_id")
+                if not isinstance(update_id, int):
+                    self._logger.error("telegram polling received malformed update without integer update_id")
+                    delivered_all = False
+                    break
+                if offset is not None and update_id < offset:
+                    continue
+                event_id = f"telegram:{update_id}"
+                event = {
+                    "schema_version": 1,
+                    "event_id": event_id,
+                    "platform": "telegram",
+                    "event_type": "update",
+                    "occurred_at": _occurred_at(),
+                    "payload": update,
+                }
+                self._logger.info("telegram_update_received telegram_update_id=%s event_id=%s", update_id, event_id)
+                try:
+                    outcome = await self._platform_events_client.deliver(event)
+                except TransientPlatformEventError as error:
+                    self._logger.warning(
+                        "platform_event_retry telegram_update_id=%s event_id=%s retry_in=%.0fs: %s",
+                        update_id,
+                        event_id,
+                        delay,
+                        error,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, self._max_retry_delay)
+                    delivered_all = False
+                    break
+                except PlatformAuthenticationError as error:
+                    self._logger.error("platform events authentication degraded: %s", error)
+                    await asyncio.sleep(self._max_retry_delay)
+                    delivered_all = False
+                    break
+                except PermanentPlatformEventError as error:
+                    self._logger.error(
+                        "platform event permanently rejected; retaining telegram_update_id=%s: %s", update_id, error
+                    )
+                    await asyncio.sleep(self._max_retry_delay)
+                    delivered_all = False
+                    break
+
+                await self.storage.advance_telegram_offset(update_id + 1)
+                if outcome == "accepted":
+                    self._logger.info("platform_event_delivered telegram_update_id=%s event_id=%s", update_id, event_id)
+                else:
+                    self._logger.info("platform_event_duplicate telegram_update_id=%s event_id=%s", update_id, event_id)
+            if not delivered_all:
+                continue
+
+
+def _occurred_at() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
