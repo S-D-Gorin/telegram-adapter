@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sprotect-telegram-adapter"
+version = "0.1.0"
+description = "Platform adapter between Telegram Bot API and Sprotect Backend"
+requires-python = ">=3.13"
+dependencies = [
+  "httpx>=0.28,<1",
+  "websockets>=14,<16",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.24,<1"]
+
+[project.scripts]
+sprotect-telegram-adapter = "app.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

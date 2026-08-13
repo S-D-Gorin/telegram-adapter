@@ -1,0 +1,15 @@
+services:
+  telegram-adapter:
+    image: sprotectbots/telegram-adapter:latest
+    build: .
+    restart: unless-stopped
+    environment:
+      SERVER_API: ${SERVER_API}
+      BOT_TOKEN: ${BOT_TOKEN}
+      DATA_DIR: /data
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - telegram-adapter-data:/data
+
+volumes:
+  telegram-adapter-data:
