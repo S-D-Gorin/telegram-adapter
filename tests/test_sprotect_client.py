@@ -18,8 +18,8 @@ async def test_bootstrap_client_uses_stage_2a_paths_and_payloads() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if request.url.path.endswith("token/"):
-            return httpx.Response(200, json={"adapter_token": "new-token"})
-        return httpx.Response(200, json={"status": "active"})
+            return httpx.Response(200, json={"data": {"adapter": {"status": "active"}, "adapter_token": "new-token"}, "request_id": "request"})
+        return httpx.Response(200, json={"data": {"adapter": {"status": "active"}}, "request_id": "request"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
         client = SprotectBootstrapClient("https://backend.example/", transport)
@@ -57,7 +57,13 @@ async def test_client_distinguishes_temporary_and_permanent_errors() -> None:
 async def test_client_handles_one_time_token_recovery_semantics() -> None:
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(
-            lambda _: httpx.Response(409, json={"code": "adapter_token_already_issued"})
+            lambda _: httpx.Response(
+                409,
+                json={
+                    "error": {"code": "adapter_token_already_issued"},
+                    "request_id": "request",
+                },
+            )
         )
     ) as transport:
         with pytest.raises(TokenAlreadyIssuedError):

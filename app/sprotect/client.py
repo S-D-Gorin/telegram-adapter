@@ -56,9 +56,8 @@ class SprotectBootstrapClient:
         payload = await self._post(
             "/api/v1/platform-adapters/bootstrap/token/", adapter_id, pairing_secret
         )
-        if payload.get("code") == "adapter_token_already_issued":
-            raise TokenAlreadyIssuedError("adapter token was already issued and cannot be recovered")
-        token = payload.get("adapter_token")
+        data = _data(payload)
+        token = data.get("adapter_token")
         if not isinstance(token, str) or not token:
             raise PermanentBootstrapError("token response did not contain adapter_token")
         return token
@@ -67,7 +66,8 @@ class SprotectBootstrapClient:
         self, path: str, adapter_id: str, pairing_secret: str, *, platform: str | None = None
     ) -> PairingState:
         payload = await self._post(path, adapter_id, pairing_secret, platform=platform)
-        status = payload.get("status") or payload.get("pairing_status")
+        adapter = _data(payload).get("adapter")
+        status = adapter.get("status") if isinstance(adapter, dict) else None
         if not isinstance(status, str) or not status:
             raise PermanentBootstrapError("bootstrap response did not contain status")
         return PairingState(status=status)
@@ -98,7 +98,7 @@ class SprotectBootstrapClient:
         if not isinstance(payload, dict):
             raise PermanentBootstrapError("Sprotect bootstrap API returned invalid response shape")
         if response.status_code >= 400:
-            code = payload.get("code")
+            code = _error_code(payload)
             if code == "adapter_token_already_issued":
                 raise TokenAlreadyIssuedError("adapter token was already issued and cannot be recovered")
             raise PermanentBootstrapError(f"Sprotect bootstrap API returned {response.status_code}")
@@ -107,3 +107,17 @@ class SprotectBootstrapClient:
     async def close(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
+
+def _data(payload: dict[str, object]) -> dict[str, object]:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise PermanentBootstrapError("Sprotect bootstrap API returned invalid response shape")
+    return data
+
+
+def _error_code(payload: dict[str, object]) -> str | None:
+    error = payload.get("error")
+    if isinstance(error, dict) and isinstance(error.get("code"), str):
+        return error["code"]
+    return None
