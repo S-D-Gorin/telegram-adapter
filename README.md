@@ -5,12 +5,11 @@ Sprotect Telegram Adapter is an independent, single-bot service between the Tele
 The intended transport boundaries are:
 
 ```text
-Telegram → POST /platform/events → Sprotect
-Sprotect → WebSocket /platform/commands → Adapter
-Adapter → POST /platform/results → Sprotect
+Telegram → Adapter → HTTPS Platform Events → Sprotect
+Sprotect → WebSocket Operations → Adapter
 ```
 
-The adapter bootstraps a persistent identity with Sprotect and waits for an Organization owner to pair it in Guardian. Once paired, it long-polls Telegram and sends raw Telegram Updates to Sprotect Platform Events API. It still does **not** implement platform commands, results, or Telegram API actions.
+The adapter bootstraps a persistent identity with Sprotect and waits for an Organization owner to pair it in Guardian. Once paired, it long-polls Telegram and sends raw Telegram Updates to Sprotect Platform Events API. It also receives WebSocket operations, persistently stores them, and ACKs their receipt. Stage 4 does **not** execute operations through Telegram API and does not send Platform Results.
 
 ## Run with Docker Compose
 
@@ -42,6 +41,12 @@ The durable Telegram offset advances only after Sprotect returns `202 accepted` 
 The adapter creates its durable local SQLite database at `/data/adapter.db`. Compose persists it in the `telegram-adapter-data` named volume. The volume includes the installation identity, pairing secret, and adapter token, so it must be retained when moving the adapter to another server. Losing it creates a new installation that must be paired again. If the server has already issued a one-time token but the local durable write was lost, the token cannot be recovered under the bootstrap security contract.
 
 The Docker healthcheck verifies that this initialized database remains readable; no HTTP server is started for health checks. `BOT_TOKEN` remains only inside the adapter and is used only for Telegram Bot API; RabbitMQ is not required by this container.
+
+## WebSocket operation receipt
+
+The adapter connects to `/api/v1/platform-adapters/commands/ws/` using `Authorization: Bearer <adapter_token>`. An incoming operation is validated, committed to SQLite, and only then ACKed. The operation inbox has a unique `operation_id`: a redelivery with unchanged content is ACKed again without a second row; a reused ID with changed content is rejected as a protocol violation. WebSocket reconnects do not stop Telegram inbound polling.
+
+ACK means only that the adapter has durably received the operation. `send_message`, `delete_message`, and every other operation remain unexecuted until a later stage.
 
 Stop it with `Ctrl+C`; Docker sends `SIGTERM` on normal container shutdown and the adapter closes SQLite gracefully.
 

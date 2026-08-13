@@ -49,6 +49,11 @@ class UnusedEventsStub:
         pass
 
 
+class BlockingCommandsStub:
+    async def connect(self):
+        await asyncio.Event().wait()
+
+
 async def wait_for(predicate) -> None:
     for _ in range(100):
         if predicate():
@@ -65,6 +70,7 @@ async def test_unpaired_polling_then_successful_pairing_saves_token(tmp_path) ->
         bootstrap_client=client,  # type: ignore[arg-type]
         telegram_client=BlockingTelegramStub(),  # type: ignore[arg-type]
         platform_events_client=UnusedEventsStub(),  # type: ignore[arg-type]
+        platform_commands_client=BlockingCommandsStub(),  # type: ignore[arg-type]
         initial_retry_delay=0.01,
         max_retry_delay=0.02,
     )
@@ -86,6 +92,7 @@ async def test_restart_with_token_skips_bootstrap_pairing(tmp_path) -> None:
         bootstrap_client=BootstrapStub(["active"]),  # type: ignore[arg-type]
         telegram_client=BlockingTelegramStub(),  # type: ignore[arg-type]
         platform_events_client=UnusedEventsStub(),  # type: ignore[arg-type]
+        platform_commands_client=BlockingCommandsStub(),  # type: ignore[arg-type]
         initial_retry_delay=0.01,
     )
     await first.start()
@@ -99,6 +106,7 @@ async def test_restart_with_token_skips_bootstrap_pairing(tmp_path) -> None:
         bootstrap_client=client,  # type: ignore[arg-type]
         telegram_client=BlockingTelegramStub(),  # type: ignore[arg-type]
         platform_events_client=UnusedEventsStub(),  # type: ignore[arg-type]
+        platform_commands_client=BlockingCommandsStub(),  # type: ignore[arg-type]
     )
     await restarted.start()
     after, created = await restarted.storage.get_or_create_identity()

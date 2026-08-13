@@ -73,6 +73,11 @@ class EventsStub:
         self.closed = True
 
 
+class BlockingCommandsStub:
+    async def connect(self):
+        await asyncio.Event().wait()
+
+
 async def wait_for(predicate) -> None:
     for _ in range(100):
         if predicate():
@@ -99,6 +104,7 @@ def polling_app(tmp_path, telegram, events, *, delay=0.01) -> Application:
         bootstrap_client=BootstrapUnused(),  # type: ignore[arg-type]
         telegram_client=telegram,  # type: ignore[arg-type]
         platform_events_client=events,  # type: ignore[arg-type]
+        platform_commands_client=BlockingCommandsStub(),  # type: ignore[arg-type]
         initial_retry_delay=delay,
         max_retry_delay=0.05,
     )
@@ -114,6 +120,7 @@ async def test_polling_does_not_start_before_pairing(tmp_path) -> None:
         bootstrap_client=bootstrap,  # type: ignore[arg-type]
         telegram_client=telegram,  # type: ignore[arg-type]
         platform_events_client=events,  # type: ignore[arg-type]
+        platform_commands_client=BlockingCommandsStub(),  # type: ignore[arg-type]
         initial_retry_delay=1,
     )
 

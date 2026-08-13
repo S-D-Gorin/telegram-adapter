@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -17,14 +19,19 @@ from app.sprotect import (
     TransientPlatformEventError,
     PermanentPlatformEventError,
     PlatformAuthenticationError,
+    CommandAuthenticationError,
+    CommandTransportError,
+    PlatformCommandsWebSocketClient,
+    is_authentication_close,
 )
-from app.storage import AdapterIdentity, SQLiteStorage
+from app.storage import AdapterIdentity, PlatformOperation, SQLiteStorage
 from app.telegram import (
     PermanentTelegramError,
     TelegramBotClient,
     TelegramPollingConflictError,
     TransientTelegramError,
 )
+from websockets.exceptions import ConnectionClosed
 
 
 class Application:
@@ -37,6 +44,7 @@ class Application:
         bootstrap_client: SprotectBootstrapClient | None = None,
         telegram_client: TelegramBotClient | None = None,
         platform_events_client: SprotectPlatformEventsClient | None = None,
+        platform_commands_client: PlatformCommandsWebSocketClient | None = None,
         initial_retry_delay: float = 2.0,
         max_retry_delay: float = 60.0,
     ) -> None:
@@ -45,10 +53,12 @@ class Application:
         self._client = bootstrap_client or SprotectBootstrapClient(config.server_api)
         self._telegram_client = telegram_client
         self._platform_events_client = platform_events_client
+        self._platform_commands_client = platform_commands_client
         self._initial_retry_delay = initial_retry_delay
         self._max_retry_delay = max_retry_delay
         self._pairing_task: asyncio.Task[None] | None = None
         self._polling_task: asyncio.Task[None] | None = None
+        self._commands_task: asyncio.Task[None] | None = None
         self._started = False
         self._logger = logging.getLogger(__name__)
 
@@ -65,6 +75,7 @@ class Application:
             await self.storage.update_pairing_status("active")
             self._log_ready(identity)
             self._start_polling(identity)
+            self._start_commands(identity)
             return
         if identity.pairing_status == "token_unrecoverable":
             self._logger.error(
@@ -76,7 +87,7 @@ class Application:
     async def stop(self) -> None:
         if not self._started:
             return
-        for task_name in ("_polling_task", "_pairing_task"):
+        for task_name in ("_commands_task", "_polling_task", "_pairing_task"):
             task = getattr(self, task_name)
             if task is None:
                 continue
@@ -118,6 +129,7 @@ class Application:
                 identity = await self.storage.activate_identity(token)
                 self._log_ready(identity)
                 self._start_polling(identity)
+                self._start_commands(identity)
                 return
             except TokenAlreadyIssuedError:
                 await self.storage.update_pairing_status("token_unrecoverable")
@@ -143,6 +155,16 @@ class Application:
             self.config.server_api, identity.adapter_token
         )
         self._polling_task = asyncio.create_task(self._polling_loop(identity.adapter_id), name="telegram-polling")
+
+    def _start_commands(self, identity: AdapterIdentity) -> None:
+        if self._commands_task is not None or identity.adapter_token is None:
+            return
+        self._platform_commands_client = self._platform_commands_client or PlatformCommandsWebSocketClient(
+            self.config.server_api, identity.adapter_token
+        )
+        self._commands_task = asyncio.create_task(
+            self._commands_loop(identity.adapter_id), name="platform-command-websocket"
+        )
 
     async def _polling_loop(self, adapter_id: str) -> None:
         assert self._telegram_client is not None
@@ -222,6 +244,111 @@ class Application:
             if not delivered_all:
                 continue
 
+    async def _commands_loop(self, adapter_id: str) -> None:
+        assert self._platform_commands_client is not None
+        delay = self._initial_retry_delay
+        while True:
+            connection = None
+            try:
+                connection = await self._platform_commands_client.connect()
+                self._logger.info("platform_commands_connected adapter_id=%s", adapter_id)
+                delay = self._initial_retry_delay
+                while True:
+                    await self._handle_command_frame(connection, await connection.recv())
+            except CommandAuthenticationError as error:
+                self._logger.error("platform commands authentication degraded: %s", error)
+                await asyncio.sleep(self._max_retry_delay)
+            except ConnectionClosed as error:
+                if is_authentication_close(error):
+                    self._logger.error("platform commands authentication degraded: WebSocket closed with 4401")
+                    await asyncio.sleep(self._max_retry_delay)
+                else:
+                    self._logger.warning("platform commands disconnected; retrying in %.0fs", delay)
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, self._max_retry_delay)
+            except CommandTransportError as error:
+                self._logger.warning("platform commands unavailable; retrying in %.0fs: %s", delay, error)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._max_retry_delay)
+            finally:
+                if connection is not None:
+                    try:
+                        await connection.close()
+                    except Exception:  # Connection teardown cannot compromise other adapter loops.
+                        pass
+
+    async def _handle_command_frame(self, connection: Any, raw_frame: str | bytes) -> None:
+        try:
+            frame = json.loads(raw_frame)
+            if not isinstance(frame, dict) or frame.get("schema_version") != 1:
+                raise ValueError("invalid frame")
+            frame_type = frame.get("type")
+            if frame_type == "heartbeat":
+                await connection.send(json.dumps({"type": "heartbeat_ack", "schema_version": 1}))
+                return
+            if frame_type == "ack_confirmed":
+                return
+            if frame_type == "error":
+                self._logger.warning("platform command gateway returned an error frame")
+                return
+            if frame_type != "operation":
+                raise ValueError("unsupported frame type")
+            operation = _parse_operation(frame)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            self._logger.error("platform_operation_invalid")
+            return
+
+        outcome = await self.storage.store_platform_operation(operation)
+        if outcome == "conflict":
+            self._logger.error("platform_operation_protocol_violation operation_id=%s", operation.operation_id)
+            return
+        # SQLite commit in store_platform_operation completes before this ACK is written.
+        await connection.send(
+            json.dumps({"type": "ack", "schema_version": 1, "operation_id": operation.operation_id})
+        )
+        if outcome == "new":
+            self._logger.info(
+                "platform_operation_received operation_id=%s operation_type=%s",
+                operation.operation_id,
+                operation.operation_type,
+            )
+        else:
+            self._logger.info("platform_operation_duplicate operation_id=%s", operation.operation_id)
+
 
 def _occurred_at() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _parse_operation(frame: dict[str, Any]) -> PlatformOperation:
+    raw_operation = frame.get("operation")
+    if not isinstance(raw_operation, dict):
+        raise ValueError("operation is missing")
+    operation_id = raw_operation.get("operation_id")
+    schema_version = raw_operation.get("schema_version")
+    platform = raw_operation.get("platform")
+    operation_type = raw_operation.get("operation_type")
+    payload = raw_operation.get("payload")
+    if (
+        not isinstance(operation_id, str)
+        or type(schema_version) is not int
+        or schema_version != 1
+        or platform != "telegram"
+        or not isinstance(operation_type, str)
+        or not operation_type
+        or not isinstance(payload, dict)
+    ):
+        raise ValueError("invalid operation")
+    try:
+        uuid.UUID(operation_id)
+    except ValueError as error:
+        raise ValueError("invalid operation id") from error
+    return PlatformOperation(
+        operation_id=operation_id,
+        schema_version=schema_version,
+        platform=platform,
+        operation_type=operation_type,
+        payload=payload,
+        status="received",
+        received_at=datetime.now(UTC).isoformat(),
+    )

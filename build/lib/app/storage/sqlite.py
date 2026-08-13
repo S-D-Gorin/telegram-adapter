@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 import sqlite3
 import uuid
@@ -27,6 +28,26 @@ class AdapterIdentity:
             f"adapter_token={'***' if self.adapter_token else None}, "
             f"pairing_status={self.pairing_status!r}, created_at={self.created_at!r}, "
             f"paired_at={self.paired_at!r})"
+        )
+
+
+@dataclass(frozen=True, repr=False)
+class PlatformOperation:
+    operation_id: str
+    schema_version: int
+    platform: str
+    operation_type: str
+    payload: dict[str, object]
+    status: str
+    received_at: str
+
+    def __repr__(self) -> str:
+        return (
+            "PlatformOperation("
+            f"operation_id={self.operation_id!r}, schema_version={self.schema_version}, "
+            f"platform={self.platform!r}, operation_type={self.operation_type!r}, "
+            "payload='***', "
+            f"status={self.status!r}, received_at={self.received_at!r})"
         )
 
 
@@ -56,6 +77,19 @@ class SQLiteStorage:
                     pairing_status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     paired_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS platform_operations (
+                    operation_id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL,
+                    platform TEXT NOT NULL,
+                    operation_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status = 'received'),
+                    received_at TEXT NOT NULL
                 )
                 """
             )
@@ -155,6 +189,76 @@ class SQLiteStorage:
         )
         connection.commit()
 
+    async def store_platform_operation(self, operation: PlatformOperation) -> str:
+        """Durably store an immutable operation before an ACK is sent.
+
+        Returns ``new``, ``duplicate``, or ``conflict`` for a reused operation ID.
+        """
+        return await asyncio.to_thread(self._store_platform_operation_sync, operation)
+
+    def _store_platform_operation_sync(self, operation: PlatformOperation) -> str:
+        connection = self._require_connection()
+        payload_json = _canonical_json(operation.payload)
+        row = connection.execute(
+            """
+            SELECT schema_version, platform, operation_type, payload_json
+            FROM platform_operations WHERE operation_id = ?
+            """,
+            (operation.operation_id,),
+        ).fetchone()
+        if row is not None:
+            if (
+                row[0] == operation.schema_version
+                and row[1] == operation.platform
+                and row[2] == operation.operation_type
+                and row[3] == payload_json
+            ):
+                return "duplicate"
+            return "conflict"
+        connection.execute(
+            """
+            INSERT INTO platform_operations (
+                operation_id, schema_version, platform, operation_type,
+                payload_json, status, received_at
+            ) VALUES (?, ?, ?, ?, ?, 'received', ?)
+            """,
+            (
+                operation.operation_id,
+                operation.schema_version,
+                operation.platform,
+                operation.operation_type,
+                payload_json,
+                operation.received_at,
+            ),
+        )
+        connection.commit()
+        return "new"
+
+    async def get_platform_operation(self, operation_id: str) -> PlatformOperation | None:
+        return await asyncio.to_thread(self._get_platform_operation_sync, operation_id)
+
+    def _get_platform_operation_sync(self, operation_id: str) -> PlatformOperation | None:
+        row = self._require_connection().execute(
+            """
+            SELECT operation_id, schema_version, platform, operation_type, payload_json, status, received_at
+            FROM platform_operations WHERE operation_id = ?
+            """,
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row[4])
+        assert isinstance(payload, dict)
+        return PlatformOperation(
+            operation_id=str(row[0]),
+            schema_version=int(row[1]),
+            platform=str(row[2]),
+            operation_type=str(row[3]),
+            payload=payload,
+            status=str(row[5]),
+            received_at=str(row[6]),
+        )
+
     def _load_identity(self, connection: sqlite3.Connection) -> AdapterIdentity:
         row = connection.execute("SELECT * FROM adapter_identity WHERE singleton = 1").fetchone()
         if row is None:
@@ -186,3 +290,7 @@ class SQLiteStorage:
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _canonical_json(value: dict[str, object]) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

@@ -14,6 +14,12 @@ from .events import (
     SprotectPlatformEventsClient,
     TransientPlatformEventError,
 )
+from .commands import (
+    CommandAuthenticationError,
+    CommandTransportError,
+    PlatformCommandsWebSocketClient,
+    is_authentication_close,
+)
 
 __all__ = [
     "BootstrapError",
@@ -26,4 +32,8 @@ __all__ = [
     "PlatformAuthenticationError",
     "SprotectPlatformEventsClient",
     "TransientPlatformEventError",
+    "CommandAuthenticationError",
+    "CommandTransportError",
+    "PlatformCommandsWebSocketClient",
+    "is_authentication_close",
 ]

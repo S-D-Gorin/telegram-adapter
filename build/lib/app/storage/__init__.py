@@ -1,5 +1,5 @@
 """Local durable SQLite storage."""
 
-from .sqlite import AdapterIdentity, SQLiteStorage
+from .sqlite import AdapterIdentity, PlatformOperation, SQLiteStorage
 
-__all__ = ["AdapterIdentity", "SQLiteStorage"]
+__all__ = ["AdapterIdentity", "PlatformOperation", "SQLiteStorage"]
