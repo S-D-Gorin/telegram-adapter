@@ -10,7 +10,7 @@ Sprotect → WebSocket Operations → Adapter → Telegram
 Adapter → HTTPS Platform Results → Sprotect
 ```
 
-The adapter bootstraps a persistent identity with Sprotect and waits for an Organization owner to pair it in Guardian. Once paired, it long-polls Telegram, sends raw Telegram Updates to Platform Events API, receives WebSocket operations, and executes supported Telegram operations (`send_message`, `delete_message`, `get_chat_member`). Terminal outcomes are durably stored before the adapter sends a Platform Result.
+The adapter bootstraps a persistent identity with Sprotect and waits for an Organization owner to pair it in Guardian. Once paired, it long-polls Telegram, sends raw Telegram Updates to Platform Events API, receives WebSocket operations, and executes supported Telegram operations (`send_message`, `delete_message`, `get_chat_member`, `get_resource_administrators`, `get_resource_member_count`, `get_resource_info`, and `get_resource_bot_membership`). Terminal outcomes are durably stored before the adapter sends a Platform Result.
 
 ## Run with Docker Compose
 
@@ -59,7 +59,7 @@ The local inbox lifecycle is `received → executing → completed`; a completed
 
 Telegram cannot prove whether a `sendMessage` request succeeded if the process crashes or loses transport after marking the operation `executing`. On startup those rows become `execution_unknown` and are deliberately not replayed automatically, preventing a duplicate user-visible message.
 
-`get_chat_member` is read-only and therefore has different recovery semantics. Telegram `429`, network/timeouts, and `5xx` keep the durable operation pending and retry with bounded backoff; an `executing` membership lookup is safely returned to `received` after restart. Telegram `400` errors that identify an invalid or unavailable chat/member are terminal and produce a failed Platform Result with `retryable: false`. Successful results contain Telegram's `chat_member` object; Sprotect remains responsible for membership business logic.
+`get_chat_member` and the `get_resource_*` operations are read-only and therefore have different recovery semantics. Telegram `429`, network/timeouts, and `5xx` keep their durable operations pending and retry with bounded backoff; an `executing` read-only lookup is safely returned to `received` after restart. Telegram `400` errors that identify an invalid or unavailable chat/member are terminal and produce a failed Platform Result with `retryable: false`. Successful resource operations use a platform-neutral `resource.id` input and return normalized state plus optional opaque Telegram `raw_data`; Sprotect remains responsible for membership business logic.
 
 Stop it with `Ctrl+C`; Docker sends `SIGTERM` on normal container shutdown and the adapter closes SQLite gracefully.
 

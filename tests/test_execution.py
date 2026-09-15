@@ -22,12 +22,16 @@ class BootstrapUnused:
 
 
 class OperationsStub:
-    def __init__(self, *, send=None, delete=None, membership=None) -> None:
+    def __init__(self, *, send=None, delete=None, membership=None, administrators=None, member_count=None, resource_info=None, bot_membership=None) -> None:
         self.send = send if send is not None else {"telegram_chat_id": "1", "telegram_message_id": "2"}
         self.delete = delete if delete is not None else {"telegram_chat_id": "1", "telegram_message_id": "2", "deleted": True}
         self.membership = membership if membership is not None else {
             "chat_member": {"status": "member", "user": {"id": 42, "is_bot": False}}
         }
+        self.administrators = administrators if administrators is not None else {"administrators": []}
+        self.member_count = member_count if member_count is not None else {"member_count": 1}
+        self.resource_info = resource_info if resource_info is not None else {"resource": {"id": "1"}}
+        self.bot_membership = bot_membership if bot_membership is not None else {"membership": {"status": "member"}}
         self.calls: list[str] = []
         self.closed = False
 
@@ -48,6 +52,30 @@ class OperationsStub:
         if isinstance(self.membership, Exception):
             raise self.membership
         return self.membership
+
+    async def get_resource_administrators(self, payload):
+        self.calls.append("get_resource_administrators")
+        if isinstance(self.administrators, Exception):
+            raise self.administrators
+        return self.administrators
+
+    async def get_resource_member_count(self, payload):
+        self.calls.append("get_resource_member_count")
+        if isinstance(self.member_count, Exception):
+            raise self.member_count
+        return self.member_count
+
+    async def get_resource_info(self, payload):
+        self.calls.append("get_resource_info")
+        if isinstance(self.resource_info, Exception):
+            raise self.resource_info
+        return self.resource_info
+
+    async def get_resource_bot_membership(self, payload):
+        self.calls.append("get_resource_bot_membership")
+        if isinstance(self.bot_membership, Exception):
+            raise self.bot_membership
+        return self.bot_membership
 
     async def close(self) -> None:
         self.closed = True
@@ -210,13 +238,63 @@ async def test_executing_membership_lookup_is_requeued_after_restart(tmp_path) -
     await first.storage.close()
 
     recovered = await prepared_app(tmp_path, OperationsStub(), ResultsStub([]))
-    assert await recovered.storage.recover_executing_membership_operations() == 1
+    assert await recovered.storage.recover_executing_read_only_operations() == 1
     assert await recovered.storage.mark_executing_operations_unknown() == 0
     claimed = await recovered.storage.claim_next_platform_operation()
     assert claimed is not None
     assert claimed.operation_id == operation_id
     assert claimed.operation_type == "get_chat_member"
     await recovered.storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation_type",
+    [
+        "get_chat_member",
+        "get_resource_administrators",
+        "get_resource_member_count",
+        "get_resource_info",
+        "get_resource_bot_membership",
+    ],
+)
+async def test_all_read_only_operations_are_recovered_after_restart(tmp_path, operation_type) -> None:
+    first = await prepared_app(tmp_path, OperationsStub(), ResultsStub([]))
+    payload = {"resource": {"id": "-100"}}
+    if operation_type == "get_chat_member":
+        payload = {"chat_id": "-100", "user_id": "42"}
+    operation_id = await add_operation(first, operation_type, payload)
+    assert await first.storage.claim_next_platform_operation() is not None
+    await first.storage.close()
+
+    recovered = await prepared_app(tmp_path, OperationsStub(), ResultsStub([]))
+    assert await recovered.storage.recover_executing_read_only_operations() == 1
+    claimed = await recovered.storage.claim_next_platform_operation()
+    assert claimed is not None and claimed.operation_id == operation_id
+    await recovered.storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation_type",
+    [
+        "get_resource_administrators",
+        "get_resource_member_count",
+        "get_resource_info",
+        "get_resource_bot_membership",
+    ],
+)
+async def test_executor_routes_each_resource_operation(tmp_path, operation_type) -> None:
+    operations = OperationsStub()
+    app = await prepared_app(tmp_path, operations, ResultsStub([]))
+    operation = PlatformOperation(
+        str(uuid.uuid4()), 1, "telegram", operation_type, {"resource": {"id": "-100"}}, "received", "now"
+    )
+
+    await app._execute_operation(operation)
+
+    assert operations.calls == [operation_type]
+    await app.storage.close()
 
 
 @pytest.mark.asyncio
@@ -371,6 +449,139 @@ async def test_get_chat_member_retryable_failure_is_not_completed(tmp_path) -> N
         "received",
         "executing",
     }
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await app.storage.close()
+
+
+@pytest.mark.asyncio
+async def test_get_resource_administrators_normalizes_creator_anonymous_and_bot() -> None:
+    members = [
+        {
+            "status": "creator",
+            "user": {"id": 1, "is_bot": False, "first_name": "Owner", "username": "owner"},
+            "is_anonymous": True,
+            "custom_title": "Founder",
+        },
+        {
+            "status": "administrator",
+            "user": {"id": 2, "is_bot": True, "first_name": "HelperBot"},
+            "is_anonymous": False,
+            "can_delete_messages": True,
+        },
+    ]
+    requests = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: requests.append(request) or httpx.Response(200, json={"ok": True, "result": members})
+        )
+    ) as client:
+        result = await TelegramOperationsClient("bot-secret", client).get_resource_administrators(
+            {"resource": {"id": "-100"}}
+        )
+
+    assert json.loads(requests[0].content) == {"chat_id": "-100", "return_bots": True}
+    assert result["resource"] == {"id": "-100"}
+    assert result["administrators"][0]["role"] == "creator"
+    assert result["administrators"][0]["is_anonymous"] is True
+    assert result["administrators"][0]["custom_title"] == "Founder"
+    assert result["administrators"][1]["user"] == {"id": "2", "is_bot": True, "first_name": "HelperBot"}
+    assert result["administrators"][1]["raw_data"]["telegram"]["chat_member"]["can_delete_messages"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_resource_administrators_rejects_malformed_member() -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"ok": True, "result": [{"status": "member"}]})
+        )
+    ) as client:
+        with pytest.raises(TelegramOperationError, match="telegram_invalid_response"):
+            await TelegramOperationsClient("bot-secret", client).get_resource_administrators(
+                {"resource": {"id": "-100"}}
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "description", "code"),
+    [
+        (400, "Bad Request: chat not found", "chat_not_found"),
+        (403, "Forbidden: bot is not a member of the channel chat", "bot_not_member"),
+        (403, "Forbidden: not enough rights to get chat administrators", "permission_denied"),
+        (400, "Bad Request: chat_id is empty", "invalid_request"),
+    ],
+)
+async def test_resource_operations_normalize_terminal_telegram_errors(status_code, description, code) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(status_code, json={"ok": False, "description": description})
+        )
+    ) as client:
+        with pytest.raises(TelegramOperationError) as captured:
+            await TelegramOperationsClient("bot-secret", client).get_resource_administrators(
+                {"resource": {"id": "-100"}}
+            )
+
+    assert captured.value.code == code
+
+
+@pytest.mark.asyncio
+async def test_resource_member_count_and_info_are_normalized() -> None:
+    def reply(request):
+        if request.url.path.endswith("getChatMemberCount"):
+            return httpx.Response(200, json={"ok": True, "result": 123})
+        return httpx.Response(
+            200,
+            json={"ok": True, "result": {"id": -100, "type": "supergroup", "title": "Group", "username": "group"}},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as client:
+        operations = TelegramOperationsClient("bot-secret", client)
+        count = await operations.get_resource_member_count({"resource": {"id": "-100"}})
+        info = await operations.get_resource_info({"resource": {"id": "-100"}})
+
+    assert count["resource"] == {"id": "-100"}
+    assert count["member_count"] == 123
+    assert info["resource"] == {"id": "-100", "kind": "supergroup", "display_name": "Group", "handle": "group"}
+    assert info["raw_data"]["telegram"]["data"]["title"] == "Group"
+
+
+@pytest.mark.asyncio
+async def test_resource_bot_membership_uses_and_caches_get_me() -> None:
+    calls = []
+
+    def reply(request):
+        calls.append(request.url.path.rsplit("/", 1)[-1])
+        if request.url.path.endswith("getMe"):
+            return httpx.Response(200, json={"ok": True, "result": {"id": 77, "is_bot": True, "first_name": "Guardian"}})
+        return httpx.Response(
+            200,
+            json={"ok": True, "result": {"status": "restricted", "is_member": True, "user": {"id": 77, "is_bot": True, "first_name": "Guardian"}, "can_delete_messages": True}},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as client:
+        operations = TelegramOperationsClient("bot-secret", client)
+        first = await operations.get_resource_bot_membership({"resource": {"id": "-100"}})
+        second = await operations.get_resource_bot_membership({"resource": {"id": "-200"}})
+
+    assert calls == ["getMe", "getChatMember", "getChatMember"]
+    assert first["bot"] == {"id": "77", "is_bot": True, "first_name": "Guardian"}
+    assert first["membership"] == {"status": "restricted", "role": "restricted", "is_member": True}
+    assert second["resource"] == {"id": "-200"}
+
+
+@pytest.mark.asyncio
+async def test_new_read_only_operation_retries_temporary_failure(tmp_path) -> None:
+    operations = OperationsStub(administrators=TelegramOperationError("rate_limited", retryable=True))
+    app = await prepared_app(tmp_path, operations, ResultsStub([]))
+    operation_id = await add_operation(app, "get_resource_administrators", {"resource": {"id": "-100"}})
+    task = asyncio.create_task(app._executor_loop())
+
+    await wait_for(lambda: operations.calls.count("get_resource_administrators") >= 2)
+    assert await app.storage.list_pending_results() == []
+    assert (await app.storage.get_platform_operation(operation_id)).status in {"received", "executing"}  # type: ignore[union-attr]
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
