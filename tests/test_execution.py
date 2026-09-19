@@ -331,15 +331,28 @@ async def test_permanent_result_rejection_keeps_durable_pending_result(tmp_path)
 @pytest.mark.asyncio
 async def test_results_http_client_uses_exact_envelope_and_bearer_token() -> None:
     requests = []
+    snapshot = {
+        "resource": {"id": "-100"},
+        "bot": {"id": "77", "is_bot": True},
+        "membership": {"status": "left", "role": "left", "is_member": False, "permissions": {}},
+        "observed_at": "2000-01-01T00:00:00Z",
+    }
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: requests.append(request) or httpx.Response(200, json={}))
     ) as client:
-        result = PendingResult(str(uuid.uuid4()), str(uuid.uuid4()), 1, "telegram", "failed", {}, {"code": "x"}, "2026-01-01T00:00:00Z", "pending")
+        result = PendingResult(
+            str(uuid.uuid4()), str(uuid.uuid4()), 1, "telegram", "failed", snapshot,
+            {"code": "bot_not_member", "retryable": False}, "2026-01-01T00:00:01Z", "pending",
+        )
         assert await SprotectPlatformResultsClient("https://backend.example", "adapter-secret", client).deliver(result) == "duplicate"
 
     assert requests[0].url.path == "/api/v1/platform-adapters/results/"
     assert requests[0].headers["Authorization"] == "Bearer adapter-secret"
-    assert json.loads(requests[0].content)["result_id"] == result.result_id
+    envelope = json.loads(requests[0].content)
+    assert envelope["result_id"] == result.result_id
+    assert envelope["status"] == "failed"
+    assert envelope["error"] == {"code": "bot_not_member", "retryable": False}
+    assert envelope["result"] == snapshot
 
 
 @pytest.mark.asyncio
@@ -508,7 +521,7 @@ async def test_get_resource_administrators_rejects_malformed_member() -> None:
     ("status_code", "description", "code"),
     [
         (400, "Bad Request: chat not found", "chat_not_found"),
-        (403, "Forbidden: bot is not a member of the channel chat", "bot_not_member"),
+        (403, "Forbidden: bot is not a member of the channel chat", "permission_denied"),
         (403, "Forbidden: not enough rights to get chat administrators", "permission_denied"),
         (400, "Bad Request: chat_id is empty", "invalid_request"),
     ],
@@ -544,7 +557,12 @@ async def test_resource_member_count_and_info_are_normalized() -> None:
 
     assert count["resource"] == {"id": "-100"}
     assert count["member_count"] == 123
-    assert info["resource"] == {"id": "-100", "kind": "supergroup", "display_name": "Group", "handle": "group"}
+    assert info["resource"] == {
+        "id": "-100",
+        "title": "Group",
+        "username": "group",
+        "type": "supergroup",
+    }
     assert info["raw_data"]["telegram"]["data"]["title"] == "Group"
 
 
@@ -568,7 +586,12 @@ async def test_resource_bot_membership_uses_and_caches_get_me() -> None:
 
     assert calls == ["getMe", "getChatMember", "getChatMember"]
     assert first["bot"] == {"id": "77", "is_bot": True, "first_name": "Guardian"}
-    assert first["membership"] == {"status": "restricted", "role": "restricted", "is_member": True}
+    assert first["membership"] == {
+        "status": "restricted",
+        "role": "restricted",
+        "is_member": True,
+        "permissions": {},
+    }
     assert second["resource"] == {"id": "-200"}
 
 
@@ -582,6 +605,39 @@ async def test_new_read_only_operation_retries_temporary_failure(tmp_path) -> No
     await wait_for(lambda: operations.calls.count("get_resource_administrators") >= 2)
     assert await app.storage.list_pending_results() == []
     assert (await app.storage.get_platform_operation(operation_id)).status in {"received", "executing"}  # type: ignore[union-attr]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await app.storage.close()
+
+
+@pytest.mark.asyncio
+async def test_bot_not_member_terminal_snapshot_is_persisted_with_failed_result(tmp_path) -> None:
+    snapshot = {
+        "resource": {"id": "-100"},
+        "bot": {"id": "77", "is_bot": True, "first_name": "Guardian"},
+        "membership": {"status": "left", "role": "left", "is_member": False, "permissions": {}},
+        "observed_at": "2026-01-01T00:00:00Z",
+    }
+    operations = OperationsStub(
+        bot_membership=TelegramOperationError("bot_not_member", terminal_result=snapshot)
+    )
+    app = await prepared_app(tmp_path, operations, ResultsStub([]))
+    await add_operation(app, "get_resource_bot_membership", {"resource": {"id": "-100"}})
+    task = asyncio.create_task(app._executor_loop())
+
+    for _ in range(100):
+        pending = await app.storage.list_pending_results()
+        if pending:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("missing terminal bot membership result")
+
+    assert pending[0].status == "failed"
+    assert pending[0].error is not None and pending[0].error["code"] == "bot_not_member"
+    assert pending[0].result == snapshot
+    assert snapshot["observed_at"] <= pending[0].completed_at
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

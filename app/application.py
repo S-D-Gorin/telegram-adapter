@@ -487,7 +487,7 @@ class Application:
                 await self._complete_with_result(
                     operation,
                     status="failed",
-                    result={},
+                    result=error.terminal_result or {},
                     error={
                         "code": error.code,
                         "description": error.description,

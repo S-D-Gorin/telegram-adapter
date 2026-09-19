@@ -17,11 +17,16 @@ class TelegramOperationError(Exception):
         description: str = "Telegram operation failed",
         retryable: bool = False,
         ambiguous: bool = False,
+        terminal_result: dict[str, object] | None = None,
     ) -> None:
         self.code = code
         self.description = description[:255]
         self.retryable = retryable
         self.ambiguous = ambiguous
+        # Some terminal states are themselves authoritative snapshots.  Keeping
+        # that snapshot on the error lets the common result pipeline persist a
+        # failed result without introducing a second delivery path.
+        self.terminal_result = terminal_result
         super().__init__(code)
 
 
@@ -97,36 +102,39 @@ class TelegramOperationsClient:
     async def get_resource_administrators(self, payload: dict[str, object]) -> dict[str, object]:
         chat_id = _resource_id(payload)
         result = await self._call("getChatAdministrators", {"chat_id": chat_id, "return_bots": True})
+        observed_at = _observed_at()
         if not isinstance(result, list):
             raise TelegramOperationError("telegram_invalid_response")
         administrators = [_normalize_administrator(member) for member in result]
         return {
             "resource": {"id": str(chat_id)},
             "administrators": administrators,
-            "observed_at": _observed_at(),
+            "observed_at": observed_at,
             "raw_data": {"telegram": {"method": "getChatAdministrators", "data": result}},
         }
 
     async def get_resource_member_count(self, payload: dict[str, object]) -> dict[str, object]:
         chat_id = _resource_id(payload)
         result = await self._call("getChatMemberCount", {"chat_id": chat_id})
+        observed_at = _observed_at()
         if type(result) is not int or result < 0:
             raise TelegramOperationError("telegram_invalid_response")
         return {
             "resource": {"id": str(chat_id)},
             "member_count": result,
-            "observed_at": _observed_at(),
+            "observed_at": observed_at,
         }
 
     async def get_resource_info(self, payload: dict[str, object]) -> dict[str, object]:
         chat_id = _resource_id(payload)
         result = await self._call("getChat", {"chat_id": chat_id})
+        observed_at = _observed_at()
         if not isinstance(result, dict):
             raise TelegramOperationError("telegram_invalid_response")
         resource = _normalize_resource(result)
         return {
             "resource": resource,
-            "observed_at": _observed_at(),
+            "observed_at": observed_at,
             "raw_data": {"telegram": {"method": "getChat", "data": result}},
         }
 
@@ -136,12 +144,13 @@ class TelegramOperationsClient:
         bot_id = bot["id"]
         assert isinstance(bot_id, str)
         result = await self._call("getChatMember", {"chat_id": chat_id, "user_id": int(bot_id)})
+        observed_at = _observed_at()
         membership = _normalize_membership(result, expected_user_id=int(bot_id))
-        return {
+        snapshot = {
             "resource": {"id": str(chat_id)},
             "bot": bot,
             "membership": membership,
-            "observed_at": _observed_at(),
+            "observed_at": observed_at,
             "raw_data": {
                 "telegram": {
                     "get_me": raw_bot,
@@ -149,6 +158,13 @@ class TelegramOperationsClient:
                 }
             },
         }
+        if _is_authoritative_non_member(membership):
+            raise TelegramOperationError(
+                "bot_not_member",
+                description="Telegram confirmed that the bot is not a member of the resource",
+                terminal_result=snapshot,
+            )
+        return snapshot
 
     async def _get_bot_user(self) -> tuple[dict[str, object], dict[str, object]]:
         async with self._bot_user_lock:
@@ -201,8 +217,6 @@ class TelegramOperationsClient:
         if method == "getChatMember":
             if "user not found" in description or "participant_id_invalid" in description:
                 raise TelegramOperationError("membership_not_found", description=description)
-            if "bot was kicked" in description or "bot is not a member" in description:
-                raise TelegramOperationError("bot_not_member", description=description)
             if (
                 "chat not found" in description
                 or "chat was deleted" in description
@@ -215,8 +229,6 @@ class TelegramOperationsClient:
             or "group chat was deleted" in description
         ):
             raise TelegramOperationError("chat_not_found", description=description)
-        if "bot was kicked" in description or "bot is not a member" in description:
-            raise TelegramOperationError("bot_not_member", description=description)
         if (
             "not enough rights" in description
             or "not authorized" in description
@@ -248,14 +260,14 @@ def _required_int(payload: dict[str, object], field: str) -> int:
     return _as_int(payload[field])
 
 
-def _resource_id(payload: dict[str, object]) -> str | int:
+def _resource_id(payload: dict[str, object]) -> str:
     resource = payload.get("resource")
     if not isinstance(resource, dict):
         raise TelegramOperationError("invalid_operation_payload")
     resource_id = resource.get("id")
-    if isinstance(resource_id, bool) or not isinstance(resource_id, (str, int)):
+    if not isinstance(resource_id, str):
         raise TelegramOperationError("invalid_operation_payload")
-    if isinstance(resource_id, str) and not resource_id.strip():
+    if not resource_id.strip():
         raise TelegramOperationError("invalid_operation_payload")
     return resource_id
 
@@ -304,25 +316,22 @@ def _normalize_administrator(raw_member: object) -> dict[str, object]:
 def _normalize_resource(raw_chat: dict[str, object]) -> dict[str, object]:
     chat_id = raw_chat.get("id")
     kind = raw_chat.get("type")
-    if type(chat_id) is not int or kind not in {"private", "group", "supergroup", "channel"}:
+    if type(chat_id) is not int or not isinstance(kind, str):
         raise TelegramOperationError("telegram_invalid_response")
-    resource: dict[str, object] = {"id": str(chat_id), "kind": kind}
+    if kind == "private":
+        raise TelegramOperationError(
+            "unsupported_resource_type",
+            description="Private chats are not supported Resource State Sync resources",
+        )
+    if kind not in {"group", "supergroup", "channel"}:
+        raise TelegramOperationError("telegram_invalid_response")
     title = raw_chat.get("title")
-    if title is not None:
-        if not isinstance(title, str):
-            raise TelegramOperationError("telegram_invalid_response")
-        resource["display_name"] = title
-    elif kind == "private":
-        first_name = raw_chat.get("first_name")
-        last_name = raw_chat.get("last_name")
-        if isinstance(first_name, str):
-            resource["display_name"] = " ".join(part for part in (first_name, last_name) if isinstance(part, str))
+    if not isinstance(title, str):
+        raise TelegramOperationError("telegram_invalid_response")
     username = raw_chat.get("username")
-    if username is not None:
-        if not isinstance(username, str):
-            raise TelegramOperationError("telegram_invalid_response")
-        resource["handle"] = username
-    return resource
+    if username is not None and not isinstance(username, str):
+        raise TelegramOperationError("telegram_invalid_response")
+    return {"id": str(chat_id), "title": title, "username": username, "type": kind}
 
 
 def _normalize_membership(raw_member: object, *, expected_user_id: int) -> dict[str, object]:
@@ -340,8 +349,30 @@ def _normalize_membership(raw_member: object, *, expected_user_id: int) -> dict[
         if type(restricted_member) is not bool:
             raise TelegramOperationError("telegram_invalid_response")
         is_member = restricted_member
-    membership: dict[str, object] = {"status": status, "role": status, "is_member": is_member}
+    permissions: dict[str, bool] = {}
+    if status == "administrator":
+        permissions = {
+            "delete_messages": _permission(raw_member, "can_delete_messages"),
+            "post_messages": _permission(raw_member, "can_post_messages"),
+        }
+    membership: dict[str, object] = {
+        "status": status,
+        "role": status,
+        "is_member": is_member,
+        "permissions": permissions,
+    }
     return membership
+
+
+def _permission(raw_member: dict[str, object], field: str) -> bool:
+    value = raw_member.get(field, False)
+    if type(value) is not bool:
+        raise TelegramOperationError("telegram_invalid_response")
+    return value
+
+
+def _is_authoritative_non_member(membership: dict[str, object]) -> bool:
+    return membership["status"] in {"left", "kicked"} or membership["is_member"] is False
 
 
 def _observed_at() -> str:
