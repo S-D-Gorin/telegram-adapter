@@ -11,6 +11,7 @@ from .client import (
 from .events import (
     PermanentPlatformEventError,
     PlatformAuthenticationError,
+    PlatformRateLimitError,
     SprotectPlatformEventsClient,
     TransientPlatformEventError,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "TransientBootstrapError",
     "PermanentPlatformEventError",
     "PlatformAuthenticationError",
+    "PlatformRateLimitError",
     "SprotectPlatformEventsClient",
     "TransientPlatformEventError",
     "CommandAuthenticationError",

@@ -6,12 +6,15 @@ import asyncio
 import json
 import secrets
 import sqlite3
+import time
 import uuid
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 from app.domain import READ_ONLY_OPERATION_TYPES
+from app.telegram.partitioning import migration_target_partition, partition_key_for_update
 
 
 @dataclass(frozen=True, repr=False)
@@ -76,11 +79,65 @@ class PendingResult:
 
 
 @dataclass(frozen=True, repr=False)
-class PendingPlatformEvent:
+class NewPlatformEvent:
+    """A Telegram update about to be committed to the durable event outbox."""
+
     event_id: str
     telegram_update_id: int
+    partition_key: str
+    migrate_to_partition: str | None
+    envelope: dict[str, object]
+    received_at: float
+
+
+@dataclass(frozen=True, repr=False)
+class PlatformEvent:
+    event_id: str
+    telegram_update_id: int
+    partition_key: str
     envelope: dict[str, object]
     delivery_status: str
+    attempt_count: int = 0
+    permanent_failure_count: int = 0
+    next_attempt_at: float = 0.0
+    last_attempt_at: float | None = None
+    last_error: str | None = None
+    last_http_status: int | None = None
+    received_at: float = 0.0
+    finished_at: float | None = None
+    migrate_to_partition: str | None = None
+
+    def __repr__(self) -> str:
+        return (
+            "PlatformEvent("
+            f"event_id={self.event_id!r}, telegram_update_id={self.telegram_update_id}, "
+            f"partition_key={self.partition_key!r}, envelope='***', "
+            f"delivery_status={self.delivery_status!r}, attempt_count={self.attempt_count})"
+        )
+
+
+@dataclass(frozen=True)
+class PlatformEventHead:
+    """The oldest pending event of a partition that is due for delivery.
+
+    ``envelope`` is loaded only for heads that are not blocked by a migration.
+    """
+
+    event_id: str
+    telegram_update_id: int
+    partition_key: str
+    attempt_count: int
+    permanent_failure_count: int
+    blocked_by_event_id: str | None
+    envelope: dict[str, object] | None = field(default=None, repr=False)
+
+
+_EVENT_STATUSES = ("pending", "delivered", "rejected", "expired")
+_PLATFORM_EVENT_COLUMNS = """
+    event_id, telegram_update_id, partition_key, envelope_json, status, attempt_count,
+    permanent_failure_count, next_attempt_at, last_attempt_at, last_error, last_http_status,
+    received_at, finished_at, migrate_to_partition
+"""
 
 
 class SQLiteStorage:
@@ -92,7 +149,18 @@ class SQLiteStorage:
     async def _run(self, function, *args):
         """Serialize one SQLite connection across the adapter's independent loops."""
         async with self._lock:
-            return await asyncio.to_thread(function, *args)
+            worker = asyncio.ensure_future(asyncio.to_thread(function, *args))
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # A running SQLite call cannot be interrupted. Keep the connection
+                # locked until it finishes so shutdown never closes it mid-commit.
+                while not worker.done():
+                    try:
+                        await asyncio.wait({worker})
+                    except asyncio.CancelledError:
+                        pass
+                raise
 
     async def initialize(self) -> None:
         await self._run(self._initialize_sync)
@@ -142,16 +210,8 @@ class SQLiteStorage:
                 )
                 """
             )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS pending_platform_events (
-                    event_id TEXT PRIMARY KEY,
-                    telegram_update_id INTEGER NOT NULL UNIQUE,
-                    envelope_json TEXT NOT NULL,
-                    delivery_status TEXT NOT NULL CHECK (delivery_status IN ('pending', 'delivered'))
-                )
-                """
-            )
+            self._create_platform_events_schema(connection)
+            self._migrate_legacy_platform_events(connection)
             connection.commit()
             self.database_path.chmod(0o600)
         except BaseException:
@@ -212,6 +272,101 @@ class SQLiteStorage:
                 )
                 """
             )
+
+    @staticmethod
+    def _create_platform_events_schema(connection: sqlite3.Connection) -> None:
+        """Durable inbound outbox: one row per Telegram update, delivered FIFO per partition.
+
+        Times are Unix epoch seconds. ``migrate_to_partition`` is set on a group's
+        ``migrate_to_chat_id`` message; while that row is pending, later events of the
+        target supergroup partition wait for it.
+        """
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS platform_events (
+                event_id TEXT PRIMARY KEY,
+                telegram_update_id INTEGER NOT NULL UNIQUE,
+                partition_key TEXT NOT NULL,
+                migrate_to_partition TEXT,
+                envelope_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'delivered', 'rejected', 'expired')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                permanent_failure_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                last_attempt_at REAL,
+                last_error TEXT,
+                last_http_status INTEGER,
+                received_at REAL NOT NULL,
+                finished_at REAL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS platform_events_pending_partition
+            ON platform_events (partition_key, telegram_update_id) WHERE status = 'pending'
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS platform_events_pending_migration
+            ON platform_events (migrate_to_partition, telegram_update_id)
+            WHERE status = 'pending' AND migrate_to_partition IS NOT NULL
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS platform_events_pending_received
+            ON platform_events (received_at) WHERE status = 'pending'
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS platform_events_finished
+            ON platform_events (finished_at) WHERE status != 'pending'
+            """
+        )
+
+    @staticmethod
+    def _migrate_legacy_platform_events(connection: sqlite3.Connection) -> None:
+        """Move undelivered rows of the sequential-delivery table into the partitioned outbox.
+
+        Delivered legacy rows are history only: the Telegram offset already covers them.
+        """
+        legacy = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pending_platform_events'"
+        ).fetchone()
+        if legacy is None:
+            return
+        now = time.time()
+        rows = connection.execute(
+            """
+            SELECT event_id, telegram_update_id, envelope_json FROM pending_platform_events
+            WHERE delivery_status = 'pending'
+            """
+        ).fetchall()
+        for event_id, telegram_update_id, envelope_json in rows:
+            envelope = json.loads(envelope_json)
+            payload = envelope.get("payload") if isinstance(envelope, dict) else None
+            update = payload if isinstance(payload, dict) else {}
+            connection.execute(
+                """
+                INSERT INTO platform_events (
+                    event_id, telegram_update_id, partition_key, migrate_to_partition,
+                    envelope_json, status, received_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    event_id,
+                    telegram_update_id,
+                    partition_key_for_update(update),
+                    migration_target_partition(update),
+                    envelope_json,
+                    now,
+                ),
+            )
+        connection.execute("DROP TABLE pending_platform_events")
 
     async def get_or_create_identity(self) -> tuple[AdapterIdentity, bool]:
         return await self._run(self._get_or_create_identity_sync)
@@ -294,58 +449,38 @@ class SQLiteStorage:
         )
         connection.commit()
 
-    async def store_platform_event(self, event_id: str, telegram_update_id: int, envelope: dict[str, object]) -> PendingPlatformEvent:
-        return await self._run(self._store_platform_event_sync, event_id, telegram_update_id, envelope)
+    async def store_telegram_updates(self, events: Sequence[NewPlatformEvent], next_update_id: int) -> int:
+        """Atomically persist a whole getUpdates batch and advance the Telegram offset.
 
-    def _store_platform_event_sync(
-        self, event_id: str, telegram_update_id: int, envelope: dict[str, object]
-    ) -> PendingPlatformEvent:
-        connection = self._require_connection()
-        row = connection.execute(
-            "SELECT event_id, telegram_update_id, envelope_json, delivery_status FROM pending_platform_events WHERE event_id = ?",
-            (event_id,),
-        ).fetchone()
-        if row is None:
-            envelope_json = _canonical_json(envelope)
-            connection.execute(
-                """
-                INSERT INTO pending_platform_events (event_id, telegram_update_id, envelope_json, delivery_status)
-                VALUES (?, ?, ?, 'pending')
-                """,
-                (event_id, telegram_update_id, envelope_json),
-            )
-            connection.commit()
-            return PendingPlatformEvent(event_id, telegram_update_id, envelope, "pending")
-        stored = json.loads(row[2])
-        assert isinstance(stored, dict)
-        return PendingPlatformEvent(str(row[0]), int(row[1]), stored, str(row[3]))
+        The offset means "durably stored locally", so it moves only in the same commit
+        as the batch. Re-storing an already known update is a no-op. Returns new rows.
+        """
+        return await self._run(self._store_telegram_updates_sync, events, next_update_id)
 
-    async def list_pending_platform_events(self) -> list[PendingPlatformEvent]:
-        return await self._run(self._list_pending_platform_events_sync)
-
-    def _list_pending_platform_events_sync(self) -> list[PendingPlatformEvent]:
-        rows = self._require_connection().execute(
-            """
-            SELECT event_id, telegram_update_id, envelope_json, delivery_status
-            FROM pending_platform_events WHERE delivery_status = 'pending' ORDER BY telegram_update_id
-            """
-        ).fetchall()
-        return [
-            PendingPlatformEvent(str(row[0]), int(row[1]), json.loads(row[2]), str(row[3]))
-            for row in rows
-        ]
-
-    async def mark_event_delivered_and_advance_offset(self, event_id: str, next_update_id: int) -> None:
-        await self._run(self._mark_event_delivered_and_advance_offset_sync, event_id, next_update_id)
-
-    def _mark_event_delivered_and_advance_offset_sync(self, event_id: str, next_update_id: int) -> None:
+    def _store_telegram_updates_sync(self, events: Sequence[NewPlatformEvent], next_update_id: int) -> int:
         connection = self._require_connection()
         connection.execute("BEGIN")
         try:
-            connection.execute(
-                "UPDATE pending_platform_events SET delivery_status = 'delivered' WHERE event_id = ?",
-                (event_id,),
-            )
+            inserted = 0
+            for event in events:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO platform_events (
+                        event_id, telegram_update_id, partition_key, migrate_to_partition,
+                        envelope_json, status, received_at
+                    ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (
+                        event.event_id,
+                        event.telegram_update_id,
+                        event.partition_key,
+                        event.migrate_to_partition,
+                        _canonical_json(event.envelope),
+                        event.received_at,
+                    ),
+                )
+                inserted += cursor.rowcount
             connection.execute(
                 """
                 INSERT INTO telegram_update_state (singleton, next_update_id) VALUES (1, ?)
@@ -357,6 +492,302 @@ class SQLiteStorage:
         except BaseException:
             connection.rollback()
             raise
+        return inserted
+
+    async def count_pending_platform_events(self) -> int:
+        return await self._run(self._count_pending_platform_events_sync)
+
+    def _count_pending_platform_events_sync(self) -> int:
+        row = self._require_connection().execute(
+            "SELECT COUNT(*) FROM platform_events WHERE status = 'pending'"
+        ).fetchone()
+        return int(row[0])
+
+    async def list_ready_platform_event_heads(
+        self, *, now: float, exclude_partitions: Sequence[str], limit: int, blocked_lookahead: int
+    ) -> list[PlatformEventHead]:
+        """Return due partition heads, unblocked first, oldest update first.
+
+        Only partition heads are considered, so FIFO holds even while a head is
+        retrying; at most ``limit + blocked_lookahead`` rows are returned and only the
+        first ``limit`` unblocked heads carry a deserialized envelope.
+        """
+        return await self._run(
+            self._list_ready_platform_event_heads_sync, now, tuple(exclude_partitions), limit, blocked_lookahead
+        )
+
+    def _list_ready_platform_event_heads_sync(
+        self, now: float, exclude_partitions: tuple[str, ...], limit: int, blocked_lookahead: int
+    ) -> list[PlatformEventHead]:
+        if limit <= 0:
+            return []
+        connection = self._require_connection()
+        placeholders = ", ".join("?" for _ in exclude_partitions)
+        exclusion = f"AND e.partition_key NOT IN ({placeholders})" if exclude_partitions else ""
+        rows = connection.execute(
+            f"""
+            WITH heads AS (
+                SELECT partition_key, MIN(telegram_update_id) AS head_update_id
+                FROM platform_events WHERE status = 'pending' GROUP BY partition_key
+            )
+            SELECT e.event_id, e.telegram_update_id, e.partition_key, e.attempt_count,
+                   e.permanent_failure_count,
+                   (
+                       SELECT m.event_id FROM platform_events AS m
+                       WHERE m.status = 'pending' AND m.migrate_to_partition = e.partition_key
+                         AND m.telegram_update_id < e.telegram_update_id
+                       ORDER BY m.telegram_update_id LIMIT 1
+                   ) AS blocked_by
+            FROM heads JOIN platform_events AS e ON e.telegram_update_id = heads.head_update_id
+            WHERE e.next_attempt_at <= ? {exclusion}
+            ORDER BY blocked_by IS NOT NULL, e.telegram_update_id
+            LIMIT ?
+            """,
+            (now, *exclude_partitions, limit + blocked_lookahead),
+        ).fetchall()
+        heads: list[PlatformEventHead] = []
+        unblocked = 0
+        for row in rows:
+            envelope = None
+            if row[5] is None:
+                if unblocked >= limit:
+                    continue
+                unblocked += 1
+                envelope_row = connection.execute(
+                    "SELECT envelope_json FROM platform_events WHERE event_id = ?", (row[0],)
+                ).fetchone()
+                envelope = json.loads(envelope_row[0])
+            heads.append(
+                PlatformEventHead(
+                    event_id=str(row[0]),
+                    telegram_update_id=int(row[1]),
+                    partition_key=str(row[2]),
+                    attempt_count=int(row[3]),
+                    permanent_failure_count=int(row[4]),
+                    blocked_by_event_id=str(row[5]) if row[5] is not None else None,
+                    envelope=envelope,
+                )
+            )
+        return heads
+
+    async def mark_platform_event_delivered(self, event_id: str, *, now: float, http_status: int) -> bool:
+        return await self._run(self._mark_platform_event_delivered_sync, event_id, now, http_status)
+
+    def _mark_platform_event_delivered_sync(self, event_id: str, now: float, http_status: int) -> bool:
+        connection = self._require_connection()
+        cursor = connection.execute(
+            """
+            UPDATE platform_events
+            SET status = 'delivered', attempt_count = attempt_count + 1, last_attempt_at = ?,
+                last_http_status = ?, finished_at = ?
+            WHERE event_id = ? AND status = 'pending'
+            """,
+            (now, http_status, now, event_id),
+        )
+        connection.commit()
+        return cursor.rowcount == 1
+
+    async def record_platform_event_failure(
+        self,
+        event_id: str,
+        *,
+        now: float,
+        error: str,
+        http_status: int | None,
+        next_attempt_at: float,
+        permanent: bool,
+        max_permanent_failures: int,
+    ) -> str | None:
+        """Record one failed attempt; a permanent failure at the limit becomes ``rejected``.
+
+        Returns the resulting status, or None when the event is no longer pending.
+        """
+        return await self._run(
+            self._record_platform_event_failure_sync,
+            event_id,
+            now,
+            error,
+            http_status,
+            next_attempt_at,
+            permanent,
+            max_permanent_failures,
+        )
+
+    def _record_platform_event_failure_sync(
+        self,
+        event_id: str,
+        now: float,
+        error: str,
+        http_status: int | None,
+        next_attempt_at: float,
+        permanent: bool,
+        max_permanent_failures: int,
+    ) -> str | None:
+        connection = self._require_connection()
+        permanent_increment = 1 if permanent else 0
+        connection.execute(
+            """
+            UPDATE platform_events
+            SET attempt_count = attempt_count + 1,
+                permanent_failure_count = permanent_failure_count + ?,
+                last_attempt_at = ?, last_error = ?, last_http_status = ?, next_attempt_at = ?,
+                status = CASE WHEN permanent_failure_count + ? >= ? THEN 'rejected' ELSE status END,
+                finished_at = CASE WHEN permanent_failure_count + ? >= ? THEN ? ELSE finished_at END
+            WHERE event_id = ? AND status = 'pending'
+            """,
+            (
+                permanent_increment,
+                now,
+                error,
+                http_status,
+                next_attempt_at,
+                permanent_increment,
+                max_permanent_failures,
+                permanent_increment,
+                max_permanent_failures,
+                now,
+                event_id,
+            ),
+        )
+        connection.commit()
+        row = connection.execute("SELECT status FROM platform_events WHERE event_id = ?", (event_id,)).fetchone()
+        return str(row[0]) if row is not None else None
+
+    async def expire_platform_events(
+        self, *, received_before: float, now: float, exclude_event_ids: Sequence[str]
+    ) -> tuple[int, list[tuple[str, str]]]:
+        """Stop delivering pending events older than the TTL, except in-flight ones.
+
+        Returns the count and a small sample of ``(event_id, partition_key)`` for logs.
+        """
+        return await self._run(self._expire_platform_events_sync, received_before, now, tuple(exclude_event_ids))
+
+    def _expire_platform_events_sync(
+        self, received_before: float, now: float, exclude_event_ids: tuple[str, ...]
+    ) -> tuple[int, list[tuple[str, str]]]:
+        connection = self._require_connection()
+        placeholders = ", ".join("?" for _ in exclude_event_ids)
+        exclusion = f"AND event_id NOT IN ({placeholders})" if exclude_event_ids else ""
+        sample = connection.execute(
+            f"""
+            SELECT event_id, partition_key FROM platform_events
+            WHERE status = 'pending' AND received_at < ? {exclusion}
+            ORDER BY received_at LIMIT 10
+            """,
+            (received_before, *exclude_event_ids),
+        ).fetchall()
+        if not sample:
+            return 0, []
+        cursor = connection.execute(
+            f"""
+            UPDATE platform_events SET status = 'expired', finished_at = ?
+            WHERE status = 'pending' AND received_at < ? {exclusion}
+            """,
+            (now, received_before, *exclude_event_ids),
+        )
+        connection.commit()
+        return cursor.rowcount, [(str(row[0]), str(row[1])) for row in sample]
+
+    async def delete_finished_platform_events(self, *, finished_before: float, limit: int) -> int:
+        """Delete at most ``limit`` delivered, rejected or expired rows past retention."""
+        return await self._run(self._delete_finished_platform_events_sync, finished_before, limit)
+
+    def _delete_finished_platform_events_sync(self, finished_before: float, limit: int) -> int:
+        connection = self._require_connection()
+        cursor = connection.execute(
+            """
+            DELETE FROM platform_events WHERE rowid IN (
+                SELECT rowid FROM platform_events
+                WHERE status != 'pending' AND finished_at < ? LIMIT ?
+            )
+            """,
+            (finished_before, limit),
+        )
+        connection.commit()
+        return cursor.rowcount
+
+    async def platform_event_stats(self, *, now: float) -> dict[str, float | int]:
+        return await self._run(self._platform_event_stats_sync, now)
+
+    def _platform_event_stats_sync(self, now: float) -> dict[str, float | int]:
+        connection = self._require_connection()
+        pending, retrying, partitions, oldest = connection.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(attempt_count > 0), 0), COUNT(DISTINCT partition_key), MIN(received_at)
+            FROM platform_events WHERE status = 'pending'
+            """
+        ).fetchone()
+        blocked = connection.execute(
+            """
+            WITH heads AS (
+                SELECT partition_key, MIN(telegram_update_id) AS head_update_id
+                FROM platform_events WHERE status = 'pending' GROUP BY partition_key
+            )
+            SELECT COUNT(*) FROM heads WHERE EXISTS (
+                SELECT 1 FROM platform_events AS m
+                WHERE m.status = 'pending' AND m.migrate_to_partition = heads.partition_key
+                  AND m.telegram_update_id < heads.head_update_id
+            )
+            """
+        ).fetchone()[0]
+        return {
+            "pending_events": int(pending),
+            "retrying_events": int(retrying),
+            "active_partitions": int(partitions),
+            "migration_blocked_partitions": int(blocked),
+            "oldest_pending_age_seconds": max(0.0, now - float(oldest)) if oldest is not None else 0.0,
+        }
+
+    async def get_platform_event(self, event_id: str) -> PlatformEvent | None:
+        return await self._run(self._get_platform_event_sync, event_id)
+
+    def _get_platform_event_sync(self, event_id: str) -> PlatformEvent | None:
+        row = self._require_connection().execute(
+            f"SELECT {_PLATFORM_EVENT_COLUMNS} FROM platform_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return self._platform_event_from_row(row) if row is not None else None
+
+    async def list_platform_events(self, *, status: str | None = None, limit: int = 100) -> list[PlatformEvent]:
+        """Diagnostic listing in update order; delivery never loads the backlog this way."""
+        if status is not None and status not in _EVENT_STATUSES:
+            raise ValueError("unknown platform event status")
+        return await self._run(self._list_platform_events_sync, status, limit)
+
+    def _list_platform_events_sync(self, status: str | None, limit: int) -> list[PlatformEvent]:
+        condition = "WHERE status = ?" if status is not None else ""
+        parameters = (status, limit) if status is not None else (limit,)
+        rows = self._require_connection().execute(
+            f"""
+            SELECT {_PLATFORM_EVENT_COLUMNS} FROM platform_events {condition}
+            ORDER BY telegram_update_id LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+        return [self._platform_event_from_row(row) for row in rows]
+
+    async def list_pending_platform_events(self, *, limit: int = 100) -> list[PlatformEvent]:
+        return await self.list_platform_events(status="pending", limit=limit)
+
+    @staticmethod
+    def _platform_event_from_row(row: tuple[object, ...]) -> PlatformEvent:
+        envelope = json.loads(str(row[3]))
+        assert isinstance(envelope, dict)
+        return PlatformEvent(
+            event_id=str(row[0]),
+            telegram_update_id=int(row[1]),
+            partition_key=str(row[2]),
+            envelope=envelope,
+            delivery_status=str(row[4]),
+            attempt_count=int(row[5]),
+            permanent_failure_count=int(row[6]),
+            next_attempt_at=float(row[7]),
+            last_attempt_at=float(row[8]) if row[8] is not None else None,
+            last_error=str(row[9]) if row[9] is not None else None,
+            last_http_status=int(row[10]) if row[10] is not None else None,
+            received_at=float(row[11]),
+            finished_at=float(row[12]) if row[12] is not None else None,
+            migrate_to_partition=str(row[13]) if row[13] is not None else None,
+        )
 
     async def store_platform_operation(self, operation: PlatformOperation) -> str:
         """Durably store an immutable operation before an ACK is sent.

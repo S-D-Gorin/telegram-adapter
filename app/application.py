@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
 from app.config import Config
 from app.domain import READ_ONLY_OPERATION_TYPES
+from app.event_delivery import EventDeliveryDispatcher, EventDeliveryMetrics
 from app.logging import register_secrets
 from app.sprotect import (
     PermanentBootstrapError,
@@ -18,9 +21,6 @@ from app.sprotect import (
     SprotectPlatformEventsClient,
     TokenAlreadyIssuedError,
     TransientBootstrapError,
-    TransientPlatformEventError,
-    PermanentPlatformEventError,
-    PlatformAuthenticationError,
     CommandAuthenticationError,
     CommandTransportError,
     PlatformCommandsWebSocketClient,
@@ -29,7 +29,7 @@ from app.sprotect import (
     SprotectPlatformResultsClient,
     TransientResultDeliveryError,
 )
-from app.storage import AdapterIdentity, PendingPlatformEvent, PendingResult, PlatformOperation, SQLiteStorage
+from app.storage import AdapterIdentity, NewPlatformEvent, PendingResult, PlatformOperation, SQLiteStorage
 from app.telegram import (
     PermanentTelegramError,
     TelegramBotClient,
@@ -38,6 +38,8 @@ from app.telegram import (
     TelegramOperationError,
     TelegramOperationsClient,
 )
+from app.telegram.client import MAX_UPDATES_PER_REQUEST
+from app.telegram.partitioning import UNROUTED_PARTITION, migration_target_partition, partition_key_for_update
 from websockets.exceptions import ConnectionClosed
 
 
@@ -56,6 +58,10 @@ class Application:
         platform_results_client: SprotectPlatformResultsClient | None = None,
         initial_retry_delay: float = 2.0,
         max_retry_delay: float = 60.0,
+        clock: Callable[[], float] = time.time,
+        event_dispatch_interval: float = 0.5,
+        event_maintenance_interval: float = 60.0,
+        event_stats_interval: float = 60.0,
     ) -> None:
         self.config = config
         self.storage = SQLiteStorage(config.database_path)
@@ -67,8 +73,15 @@ class Application:
         self._platform_results_client = platform_results_client
         self._initial_retry_delay = initial_retry_delay
         self._max_retry_delay = max_retry_delay
+        self._clock = clock
+        self._event_dispatch_interval = event_dispatch_interval
+        self._event_maintenance_interval = event_maintenance_interval
+        self._event_stats_interval = event_stats_interval
+        self._event_metrics = EventDeliveryMetrics()
+        self._event_dispatcher: EventDeliveryDispatcher | None = None
         self._pairing_task: asyncio.Task[None] | None = None
         self._polling_task: asyncio.Task[None] | None = None
+        self._event_delivery_task: asyncio.Task[None] | None = None
         self._commands_task: asyncio.Task[None] | None = None
         self._executor_task: asyncio.Task[None] | None = None
         self._result_delivery_task: asyncio.Task[None] | None = None
@@ -125,6 +138,7 @@ class Application:
             "_executor_task",
             "_commands_task",
             "_polling_task",
+            "_event_delivery_task",
             "_pairing_task",
         ):
             task = getattr(self, task_name)
@@ -197,6 +211,11 @@ class Application:
         """Safe operational snapshot; no secrets or payloads."""
         return dict(self._transport_states)
 
+    @property
+    def event_metrics(self) -> dict[str, float | int | bool]:
+        """Low-cardinality inbound delivery metrics, safe to export without labels."""
+        return self._event_metrics.snapshot()
+
     def _set_transport_state(self, name: str, value: bool) -> None:
         if self._transport_states[name] == value:
             return
@@ -215,7 +234,28 @@ class Application:
             return
         self._telegram_client = self._telegram_client or TelegramBotClient(self.config.bot_token)
         self._platform_events_client = self._platform_events_client or SprotectPlatformEventsClient(
-            self.config.server_api, identity.adapter_token
+            self.config.server_api,
+            identity.adapter_token,
+            max_connections=self.config.event_delivery_concurrency,
+        )
+        self._event_dispatcher = EventDeliveryDispatcher(
+            self.storage,
+            self._platform_events_client,
+            self._event_metrics,
+            concurrency=self.config.event_delivery_concurrency,
+            max_attempts=self.config.event_max_attempts,
+            pending_ttl_seconds=self.config.event_pending_ttl_seconds,
+            retention_seconds=self.config.event_retention_seconds,
+            initial_retry_delay=self._initial_retry_delay,
+            max_retry_delay=self._max_retry_delay,
+            dispatch_interval=self._event_dispatch_interval,
+            maintenance_interval=self._event_maintenance_interval,
+            stats_interval=self._event_stats_interval,
+            clock=self._clock,
+            on_ready_change=lambda ready: self._set_transport_state("platform_events_ready", ready),
+        )
+        self._event_delivery_task = asyncio.create_task(
+            self._event_dispatcher.run(), name="platform-event-delivery"
         )
         self._polling_task = asyncio.create_task(self._polling_loop(identity.adapter_id), name="telegram-polling")
 
@@ -246,21 +286,27 @@ class Application:
             )
 
     async def _polling_loop(self, adapter_id: str) -> None:
+        """Ingest Telegram updates into the durable outbox; delivery runs separately.
+
+        The Telegram offset advances only in the same SQLite commit as the whole batch,
+        so it means "stored locally", never "delivered to Guardian".
+        """
         assert self._telegram_client is not None
-        assert self._platform_events_client is not None
         delay = self._initial_retry_delay
         self._logger.info("telegram_polling_started adapter_id=%s", adapter_id)
         while True:
-            pending_events = await self.storage.list_pending_platform_events()
-            if pending_events:
-                if not await self._deliver_pending_event(pending_events[0], delay):
-                    delay = min(delay * 2, self._max_retry_delay)
-                    continue
-                delay = self._initial_retry_delay
+            pending = await self.storage.count_pending_platform_events()
+            capacity = self.config.event_max_pending - pending
+            if capacity <= 0:
+                self._set_backpressure(True, pending)
+                await asyncio.sleep(self._event_dispatch_interval)
                 continue
+            self._set_backpressure(False, pending)
             offset = await self.storage.get_telegram_offset()
             try:
-                updates = await self._telegram_client.get_updates(offset)
+                updates = await self._telegram_client.get_updates(
+                    offset, limit=min(capacity, MAX_UPDATES_PER_REQUEST)
+                )
             except TelegramPollingConflictError:
                 self._set_transport_state("telegram_polling_ready", False)
                 self._logger.error("telegram_polling_conflict another Telegram polling instance is active")
@@ -278,81 +324,93 @@ class Application:
                 await asyncio.sleep(self._max_retry_delay)
                 continue
 
-            delay = self._initial_retry_delay
             self._set_transport_state("telegram_polling_ready", True)
-            delivered_all = True
-            for update in sorted(updates, key=lambda item: item.get("update_id", -1)):
-                update_id = update.get("update_id")
-                if not isinstance(update_id, int):
-                    self._logger.error("telegram polling received malformed update without integer update_id")
-                    delivered_all = False
-                    break
-                if offset is not None and update_id < offset:
-                    continue
-                event_id = f"telegram:{update_id}"
-                event = {
-                    "schema_version": 1,
-                    "event_id": event_id,
-                    "platform": "telegram",
-                    "event_type": "update",
-                    "occurred_at": _occurred_at(),
-                    "payload": update,
-                }
-                pending_event = await self.storage.store_platform_event(event_id, update_id, event)
-                self._logger.info("telegram_update_received telegram_update_id=%s event_id=%s", update_id, event_id)
-                if not await self._deliver_pending_event(pending_event, delay):
-                    delay = min(delay * 2, self._max_retry_delay)
-                    delivered_all = False
-                    break
-            if not delivered_all:
+            try:
+                progressed = await self._ingest_updates(updates, offset)
+            except Exception:
+                # Nothing was committed: the offset is unchanged and Telegram resends the batch.
+                self._logger.exception("telegram_updates_store_failed retry_in=%.0fs", delay)
+                progressed = False
+            if not progressed:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._max_retry_delay)
                 continue
+            delay = self._initial_retry_delay
 
-    async def _deliver_pending_event(self, pending_event: PendingPlatformEvent, delay: float) -> bool:
-        assert self._platform_events_client is not None
-        try:
-            outcome = await self._platform_events_client.deliver(pending_event.envelope)
-        except TransientPlatformEventError as error:
-            self._set_transport_state("platform_events_ready", False)
-            self._logger.warning(
-                "platform_event_retry telegram_update_id=%s event_id=%s retry_in=%.0fs: %s",
-                pending_event.telegram_update_id,
-                pending_event.event_id,
-                delay,
-                error,
+    async def _ingest_updates(self, updates: list[dict[str, Any]], offset: int | None) -> bool:
+        """Atomically store a batch; False only when it held nothing storable."""
+        received_at = self._clock()
+        occurred_at = _occurred_at()
+        events: list[NewPlatformEvent] = []
+        malformed = 0
+        for update in updates:
+            update_id = update.get("update_id")
+            if type(update_id) is not int:
+                malformed += 1
+                self._logger.error("telegram polling received malformed update without integer update_id")
+                continue
+            if offset is not None and update_id < offset:
+                continue
+            event_id = f"telegram:{update_id}"
+            partition_key = partition_key_for_update(update)
+            if partition_key == UNROUTED_PARTITION:
+                self._logger.info(
+                    "telegram_update_unrouted telegram_update_id=%s event_id=%s; forwarded without chat partition",
+                    update_id,
+                    event_id,
+                )
+            events.append(
+                NewPlatformEvent(
+                    event_id=event_id,
+                    telegram_update_id=update_id,
+                    partition_key=partition_key,
+                    migrate_to_partition=migration_target_partition(update),
+                    envelope={
+                        "schema_version": 1,
+                        "event_id": event_id,
+                        "platform": "telegram",
+                        "event_type": "update",
+                        "occurred_at": occurred_at,
+                        "payload": update,
+                    },
+                    received_at=received_at,
+                )
             )
-            await asyncio.sleep(delay)
-            return False
-        except PlatformAuthenticationError as error:
-            self._set_transport_state("platform_events_ready", False)
-            self._logger.error("platform events authentication degraded: %s", error)
-            await asyncio.sleep(self._max_retry_delay)
-            return False
-        except PermanentPlatformEventError as error:
-            self._set_transport_state("platform_events_ready", False)
-            self._logger.error(
-                "platform event permanently rejected; retaining telegram_update_id=%s: %s",
-                pending_event.telegram_update_id,
-                error,
+        if not events:
+            return malformed == 0
+        next_offset = max(event.telegram_update_id for event in events) + 1
+        inserted = await self.storage.store_telegram_updates(events, next_offset)
+        for event in events:
+            self._logger.debug(
+                "telegram_update_received telegram_update_id=%s event_id=%s partition_key=%s",
+                event.telegram_update_id,
+                event.event_id,
+                event.partition_key,
             )
-            await asyncio.sleep(self._max_retry_delay)
-            return False
-        await self.storage.mark_event_delivered_and_advance_offset(
-            pending_event.event_id, pending_event.telegram_update_id + 1
+        self._logger.info(
+            "telegram_updates_ingested count=%s new=%s next_offset=%s", len(events), inserted, next_offset
         )
-        self._set_transport_state("platform_events_ready", True)
-        if outcome == "accepted":
-            self._logger.info(
-                "platform_event_delivered telegram_update_id=%s event_id=%s",
-                pending_event.telegram_update_id,
-                pending_event.event_id,
+        if self._event_dispatcher is not None:
+            self._event_dispatcher.wake()
+        return True
+
+    def _set_backpressure(self, active: bool, pending: int) -> None:
+        if self._event_metrics.backpressure_active == active:
+            return
+        self._event_metrics.backpressure_active = active
+        if active:
+            self._event_metrics.backpressure_activations_total += 1
+            self._logger.warning(
+                "telegram_polling_backpressure active=true pending_events=%s max_pending=%s",
+                pending,
+                self.config.event_max_pending,
             )
         else:
             self._logger.info(
-                "platform_event_duplicate telegram_update_id=%s event_id=%s",
-                pending_event.telegram_update_id,
-                pending_event.event_id,
+                "telegram_polling_backpressure active=false pending_events=%s max_pending=%s",
+                pending,
+                self.config.event_max_pending,
             )
-        return True
 
     async def _commands_loop(self, adapter_id: str) -> None:
         assert self._platform_commands_client is not None

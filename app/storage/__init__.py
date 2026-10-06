@@ -1,5 +1,21 @@
 """Local durable SQLite storage."""
 
-from .sqlite import AdapterIdentity, PendingPlatformEvent, PendingResult, PlatformOperation, SQLiteStorage
+from .sqlite import (
+    AdapterIdentity,
+    NewPlatformEvent,
+    PendingResult,
+    PlatformEvent,
+    PlatformEventHead,
+    PlatformOperation,
+    SQLiteStorage,
+)
 
-__all__ = ["AdapterIdentity", "PendingPlatformEvent", "PendingResult", "PlatformOperation", "SQLiteStorage"]
+__all__ = [
+    "AdapterIdentity",
+    "NewPlatformEvent",
+    "PendingResult",
+    "PlatformEvent",
+    "PlatformEventHead",
+    "PlatformOperation",
+    "SQLiteStorage",
+]
