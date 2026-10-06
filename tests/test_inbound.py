@@ -891,8 +891,35 @@ async def test_http_clients_keep_bot_token_and_adapter_token_on_their_own_bounda
 
     assert "bot-secret" in str(telegram_requests[0].url)
     assert telegram_requests[0].headers.get("Authorization") is None
-    assert json.loads(telegram_requests[0].content) == {"timeout": 30, "limit": 7}
+    assert json.loads(telegram_requests[0].content) == {
+        "timeout": 30,
+        "limit": 7,
+        "allowed_updates": [
+            "message", "edited_message", "channel_post", "edited_channel_post", "chat_member", "my_chat_member",
+        ],
+    }
     assert "bot-secret" not in backend_requests[0].content.decode()
     assert backend_requests[0].headers["Authorization"] == "Bearer adapter-secret"
     assert backend_requests[0].url.path == "/api/v1/platform-adapters/events/"
     assert json.loads(backend_requests[0].content)["payload"] == update(1)
+
+
+@pytest.mark.asyncio
+async def test_every_get_updates_call_explicitly_sends_guardian_supported_allowed_updates() -> None:
+    # Telegram remembers the last allowed_updates of a bot; sending it on every call keeps
+    # the adapter independent of what a previous client (e.g. the legacy runtime) configured.
+    requests: list[dict] = []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: requests.append(json.loads(request.content)) or httpx.Response(200, json={"ok": True, "result": []})
+        )
+    ) as transport:
+        client = TelegramBotClient("bot-secret", transport)
+        await client.get_updates(None)
+        await client.get_updates(42, limit=10)
+
+    expected = ["message", "edited_message", "channel_post", "edited_channel_post", "chat_member", "my_chat_member"]
+    assert [request["allowed_updates"] for request in requests] == [expected, expected]
+    assert requests[1]["offset"] == 42
+    for excluded in ("callback_query", "chat_join_request", "inline_query", "poll", "message_reaction"):
+        assert excluded not in requests[0]["allowed_updates"]

@@ -1,5 +1,6 @@
 import pytest
 
+from app.telegram.client import ALLOWED_UPDATES
 from app.telegram.partitioning import UNROUTED_PARTITION, migration_target_partition, partition_key_for_update
 
 CHAT = {"id": -1001234, "type": "supergroup"}
@@ -47,3 +48,9 @@ def test_group_migration_points_to_the_supergroup_partition() -> None:
     assert partition_key_for_update(migration) == "-5"
     assert migration_target_partition(migration) == "-1009"
     assert migration_target_partition({"update_id": 2, "message": {"chat": {"id": -1009}, "migrate_from_chat_id": -5}}) is None
+
+
+@pytest.mark.parametrize("field", ALLOWED_UPDATES)
+def test_every_requested_update_type_routes_to_a_chat_partition(field: str) -> None:
+    # Requested types never fall back to "unrouted" during normal operation.
+    assert partition_key_for_update({"update_id": 1, field: {"chat": CHAT}}) == "-1001234"

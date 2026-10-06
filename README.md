@@ -48,6 +48,8 @@ Telegram getUpdates → SQLite outbox (one commit per batch + offset)
                     → partition by chat_id → FIFO per chat → ≤ EVENT_DELIVERY_CONCURRENCY parallel POSTs → Sprotect
 ```
 
+**Requested update types.** Every `getUpdates` call explicitly sends `allowed_updates` = `message`, `edited_message`, `channel_post`, `edited_channel_post`, `chat_member`, `my_chat_member` — exactly the types Sprotect ingests. Telegram stores this setting per bot, so sending it on every call keeps the adapter independent of any earlier configuration of the same bot. `chat_member` is delivered by Telegram only when the bot is a chat administrator.
+
 **Offset semantics.** Every `getUpdates` batch is stored in the `platform_events` outbox together with the new Telegram offset in a single SQLite commit. The offset therefore means *durably stored by the adapter*, not *delivered to Sprotect*; from that commit on, delivery is owned by the outbox. A crash before the commit simply makes Telegram resend the batch, and re-storing a known `telegram:<update_id>` is a no-op that keeps the original envelope.
 
 **Ordering.** Updates are partitioned by Telegram `chat_id`. Within a chat, events are delivered strictly in `update_id` order: the next event starts only after Sprotect ACKs the previous one with `202 accepted` or `200 duplicate`, and a retrying event is never overtaken. Different chats are delivered in parallel, with at most `EVENT_DELIVERY_CONCURRENCY` HTTP requests in flight. Updates without a usable chat (e.g. `poll`) are still forwarded raw in one shared `unrouted` FIFO partition. There is no global order across chats.

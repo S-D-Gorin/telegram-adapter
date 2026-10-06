@@ -9,6 +9,18 @@ import httpx
 # Telegram Bot API accepts getUpdates limit values from 1 to 100.
 MAX_UPDATES_PER_REQUEST = 100
 
+# Exactly the update types Guardian ingests (its SUPPORTED_TYPES); all carry a chat.
+# Telegram persists allowed_updates per bot, so it is sent on every getUpdates call
+# to stay independent of whatever an earlier client of this bot configured.
+ALLOWED_UPDATES = (
+    "message",
+    "edited_message",
+    "channel_post",
+    "edited_channel_post",
+    "chat_member",
+    "my_chat_member",
+)
+
 
 class TelegramApiError(Exception):
     """A Telegram API failure. Exception messages deliberately omit bot tokens and payloads."""
@@ -35,7 +47,11 @@ class TelegramBotClient:
     async def get_updates(
         self, offset: int | None, *, timeout: int = 30, limit: int = MAX_UPDATES_PER_REQUEST
     ) -> list[dict[str, Any]]:
-        request_body: dict[str, int] = {"timeout": timeout, "limit": max(1, min(limit, MAX_UPDATES_PER_REQUEST))}
+        request_body: dict[str, object] = {
+            "timeout": timeout,
+            "limit": max(1, min(limit, MAX_UPDATES_PER_REQUEST)),
+            "allowed_updates": list(ALLOWED_UPDATES),
+        }
         if offset is not None:
             request_body["offset"] = offset
         try:
