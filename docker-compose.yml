@@ -1,6 +1,6 @@
 services:
   telegram-adapter:
-    image: sprotectbots/telegram-adapter:0.2.0
+    image: sprotectbots/telegram-adapter:0.3.0
     build: .
     restart: unless-stopped
     environment:

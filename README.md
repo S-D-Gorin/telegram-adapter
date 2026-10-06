@@ -173,15 +173,15 @@ All terminal outcomes use the common Platform Result envelope. Optional `raw_dat
 
 ## Production image versioning
 
-This contract-compatible release is version `0.2.0`. Do not deploy `:latest`. Build and publish the verified image deliberately, then pin Guardian deployment to the resulting immutable digest:
+This contract-compatible release is version `0.3.0`. Do not deploy `:latest`. Build and publish the verified image deliberately, then pin Guardian deployment to the resulting immutable digest:
 
 ```bash
-docker build -t sprotectbots/telegram-adapter:0.2.0 .
-docker push sprotectbots/telegram-adapter:0.2.0
-docker buildx imagetools inspect sprotectbots/telegram-adapter:0.2.0
+docker build -t sprotectbots/telegram-adapter:0.3.0 .
+docker push sprotectbots/telegram-adapter:0.3.0
+docker buildx imagetools inspect sprotectbots/telegram-adapter:0.3.0
 ```
 
-Set production to `sprotectbots/telegram-adapter:0.2.0@sha256:<verified-digest>`. The checked-in Compose file uses the versioned tag for local and controlled deployments; replace it with the verified digest in the production manifest.
+Set production to `sprotectbots/telegram-adapter:0.3.0@sha256:<verified-digest>`. The checked-in Compose file uses the versioned tag for local and controlled deployments; replace it with the verified digest in the production manifest.
 
 ## Local development
 
