@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from app.domain import READ_ONLY_OPERATION_TYPES
+
 
 @dataclass(frozen=True, repr=False)
 class AdapterIdentity:
@@ -484,17 +486,19 @@ class SQLiteStorage:
         connection.commit()
         return cursor.rowcount
 
-    async def recover_executing_membership_operations(self) -> int:
-        return await self._run(self._recover_executing_membership_operations_sync)
+    async def recover_executing_read_only_operations(self) -> int:
+        return await self._run(self._recover_executing_read_only_operations_sync)
 
-    def _recover_executing_membership_operations_sync(self) -> int:
+    def _recover_executing_read_only_operations_sync(self) -> int:
         connection = self._require_connection()
+        placeholders = ", ".join("?" for _ in READ_ONLY_OPERATION_TYPES)
         cursor = connection.execute(
-            """
+            f"""
             UPDATE platform_operations
             SET status = 'received', execution_started_at = NULL
-            WHERE status = 'executing' AND operation_type = 'get_chat_member'
-            """
+            WHERE status = 'executing' AND operation_type IN ({placeholders})
+            """,
+            tuple(READ_ONLY_OPERATION_TYPES),
         )
         connection.commit()
         return cursor.rowcount

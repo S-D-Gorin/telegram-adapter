@@ -10,7 +10,7 @@ Sprotect → WebSocket Operations → Adapter → Telegram
 Adapter → HTTPS Platform Results → Sprotect
 ```
 
-The adapter bootstraps a persistent identity with Sprotect and waits for an Organization owner to pair it in Guardian. Once paired, it long-polls Telegram, sends raw Telegram Updates to Platform Events API, receives WebSocket operations, and executes supported Telegram operations (`send_message`, `delete_message`, `get_chat_member`). Terminal outcomes are durably stored before the adapter sends a Platform Result.
+The adapter bootstraps a persistent identity with Sprotect and waits for an Organization owner to pair it in Guardian. Once paired, it long-polls Telegram, sends raw Telegram Updates to Platform Events API, receives WebSocket operations, and executes supported Telegram operations (`send_message`, `delete_message`, `get_chat_member`, `get_resource_administrators`, `get_resource_member_count`, `get_resource_info`, and `get_resource_bot_membership`). Terminal outcomes are durably stored before the adapter sends a Platform Result.
 
 ## Run with Docker Compose
 
@@ -59,9 +59,98 @@ The local inbox lifecycle is `received → executing → completed`; a completed
 
 Telegram cannot prove whether a `sendMessage` request succeeded if the process crashes or loses transport after marking the operation `executing`. On startup those rows become `execution_unknown` and are deliberately not replayed automatically, preventing a duplicate user-visible message.
 
-`get_chat_member` is read-only and therefore has different recovery semantics. Telegram `429`, network/timeouts, and `5xx` keep the durable operation pending and retry with bounded backoff; an `executing` membership lookup is safely returned to `received` after restart. Telegram `400` errors that identify an invalid or unavailable chat/member are terminal and produce a failed Platform Result with `retryable: false`. Successful results contain Telegram's `chat_member` object; Sprotect remains responsible for membership business logic.
+`get_chat_member` and the `get_resource_*` operations are read-only and therefore have different recovery semantics. Telegram `429`, network/timeouts, and `5xx` keep their durable operations pending and retry with bounded backoff; an `executing` read-only lookup is safely returned to `received` after restart. Telegram `400` errors that identify an invalid or unavailable chat/member are terminal and produce a failed Platform Result with `retryable: false`. Successful resource operations use a platform-neutral `resource.id` input and return normalized state plus optional opaque Telegram `raw_data`; Sprotect remains responsible for membership business logic.
 
 Stop it with `Ctrl+C`; Docker sends `SIGTERM` on normal container shutdown and the adapter closes SQLite gracefully.
+
+## Guardian Resource State Sync contract
+
+The following read-only operations implement the Guardian Resource State Sync wire contract:
+
+- `get_resource_administrators`
+- `get_resource_bot_membership`
+- `get_resource_info`
+- `get_resource_member_count`
+
+Each request payload must contain a non-empty **string** Telegram resource ID:
+
+```json
+{"resource": {"id": "-100123"}}
+```
+
+Numeric JSON IDs are rejected. Every successful snapshot contains `observed_at`: a UTC, timezone-aware ISO-8601 timestamp (emitted as `Z`) captured immediately after the successful Telegram response and before normalization. It is part of the durable terminal result, not generated during delivery, and precedes `completed_at`.
+
+`get_resource_administrators` returns an authoritative Telegram administrator snapshot. In particular, Guardian uses its `observed_at` field as a freshness fence.
+
+```json
+{
+  "resource": {"id": "-100123"},
+  "administrators": [
+    {
+      "user": {"id": "42", "is_bot": false, "first_name": "Owner"},
+      "role": "creator",
+      "is_anonymous": false
+    }
+  ],
+  "observed_at": "2026-01-01T00:00:00Z"
+}
+```
+
+`get_resource_info` supports only `group`, `supergroup`, and `channel`. A private chat produces terminal `unsupported_resource_type`; an absent Telegram username is represented explicitly as `null`.
+
+```json
+{
+  "resource": {
+    "id": "-100123",
+    "title": "Example",
+    "username": null,
+    "type": "supergroup"
+  },
+  "observed_at": "2026-01-01T00:00:00Z"
+}
+```
+
+`get_resource_member_count` returns a nonnegative JSON integer, including zero.
+
+```json
+{
+  "resource": {"id": "-100123"},
+  "member_count": 0,
+  "observed_at": "2026-01-01T00:00:00Z"
+}
+```
+
+`get_resource_bot_membership` identifies the current bot with `getMe`, then reads its membership using `getChatMember`. Administrator permissions are normalized as booleans: Telegram `can_delete_messages` becomes `permissions.delete_messages` and `can_post_messages` becomes `permissions.post_messages`. Missing administrator permissions are `false`; a creator and non-member have an empty permissions object.
+
+```json
+{
+  "resource": {"id": "-100123"},
+  "bot": {"id": "777", "is_bot": true, "first_name": "Guardian"},
+  "membership": {
+    "status": "administrator",
+    "role": "administrator",
+    "is_member": true,
+    "permissions": {"delete_messages": true, "post_messages": false}
+  },
+  "observed_at": "2026-01-01T00:00:00Z"
+}
+```
+
+If a successful Telegram membership response authoritatively says `left`, `kicked`, or `restricted` with `is_member=false`, the adapter sends one failed terminal result with `error.code = "bot_not_member"`, `retryable = false`, and the complete normalized membership snapshot in `result`. Transport failures, rate limits, server failures, access denials, unavailable chats, and malformed responses are never converted to `bot_not_member`.
+
+All terminal outcomes use the common Platform Result envelope. Optional `raw_data` is diagnostic-only; Guardian domain logic must consume the normalized fields above.
+
+## Production image versioning
+
+This contract-compatible release is version `0.2.0`. Do not deploy `:latest`. Build and publish the verified image deliberately, then pin Guardian deployment to the resulting immutable digest:
+
+```bash
+docker build -t sprotectbots/telegram-adapter:0.2.0 .
+docker push sprotectbots/telegram-adapter:0.2.0
+docker buildx imagetools inspect sprotectbots/telegram-adapter:0.2.0
+```
+
+Set production to `sprotectbots/telegram-adapter:0.2.0@sha256:<verified-digest>`. The checked-in Compose file uses the versioned tag for local and controlled deployments; replace it with the verified digest in the production manifest.
 
 ## Local development
 

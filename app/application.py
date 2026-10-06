@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.config import Config
+from app.domain import READ_ONLY_OPERATION_TYPES
 from app.logging import register_secrets
 from app.sprotect import (
     PermanentBootstrapError,
@@ -82,10 +83,10 @@ class Application:
 
     async def start(self) -> None:
         await self.storage.initialize()
-        recovered_count = await self.storage.recover_executing_membership_operations()
+        recovered_count = await self.storage.recover_executing_read_only_operations()
         if recovered_count:
             self._logger.warning(
-                "platform_membership_operations_recovered count=%s", recovered_count
+                "platform_read_only_operations_recovered count=%s", recovered_count
             )
         unknown_count = await self.storage.mark_executing_operations_unknown()
         if unknown_count:
@@ -450,7 +451,7 @@ class Application:
             try:
                 result_payload = await self._execute_operation(operation)
             except TelegramOperationError as error:
-                if operation.operation_type == "get_chat_member" and (
+                if operation.operation_type in READ_ONLY_OPERATION_TYPES and (
                     error.retryable or error.ambiguous
                 ):
                     await self.storage.requeue_platform_operation(operation.operation_id)
@@ -486,7 +487,7 @@ class Application:
                 await self._complete_with_result(
                     operation,
                     status="failed",
-                    result={},
+                    result=error.terminal_result or {},
                     error={
                         "code": error.code,
                         "description": error.description,
@@ -509,6 +510,14 @@ class Application:
             return await self._telegram_operations_client.delete_message(operation.payload)
         if operation.operation_type == "get_chat_member":
             return await self._telegram_operations_client.get_chat_member(operation.payload)
+        if operation.operation_type == "get_resource_administrators":
+            return await self._telegram_operations_client.get_resource_administrators(operation.payload)
+        if operation.operation_type == "get_resource_member_count":
+            return await self._telegram_operations_client.get_resource_member_count(operation.payload)
+        if operation.operation_type == "get_resource_info":
+            return await self._telegram_operations_client.get_resource_info(operation.payload)
+        if operation.operation_type == "get_resource_bot_membership":
+            return await self._telegram_operations_client.get_resource_bot_membership(operation.payload)
         raise TelegramOperationError("unsupported_operation")
 
     async def _complete_with_result(

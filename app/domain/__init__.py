@@ -1,1 +1,5 @@
-"""Platform-neutral contracts and domain models will live here."""
+"""Platform-neutral adapter concepts."""
+
+from .operations import READ_ONLY_OPERATION_TYPES
+
+__all__ = ["READ_ONLY_OPERATION_TYPES"]
