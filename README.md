@@ -24,7 +24,7 @@ docker compose up --build
 
 On its first startup, the adapter prints a one-time **Adapter registration key**. Open Guardian as the Organization owner and connect the adapter using this key. The running adapter polls the bootstrap status with exponential backoff; once pairing is confirmed it obtains and durably stores its adapter token, logs `adapter ready`, and starts Telegram long polling.
 
-Each raw Telegram Update is sent sequentially to `POST /api/v1/platform-adapters/events/` in this envelope:
+Each raw Telegram Update is sent to `POST /api/v1/platform-adapters/events/` in this envelope:
 
 ```json
 {
@@ -39,7 +39,36 @@ Each raw Telegram Update is sent sequentially to `POST /api/v1/platform-adapters
 
 The adapter uses the following paths derived from `SERVER_API`: bootstrap under `/api/v1/platform-adapters/bootstrap/`, events at `/api/v1/platform-adapters/events/`, results at `/api/v1/platform-adapters/results/`, and commands at `/api/v1/platform-adapters/commands/ws/`. A trailing slash in `SERVER_API` is safe; HTTPS automatically maps the command URL to `wss://`.
 
-The raw event envelope is first persisted in SQLite with its stable `telegram:<update_id>` ID. The durable Telegram offset advances only after Sprotect returns `202 accepted` or `200 duplicate`. Temporary backend failures, including `5xx`, retain that local event and retry its unchanged envelope; rejected events and revoked credentials enter a visible degraded state without losing the update. A Telegram `409` means another polling instance is active and is retried slowly.
+A Telegram `409` means another polling instance is active and is retried slowly.
+
+## Inbound event delivery
+
+```text
+Telegram getUpdates → SQLite outbox (one commit per batch + offset)
+                    → partition by chat_id → FIFO per chat → ≤ EVENT_DELIVERY_CONCURRENCY parallel POSTs → Sprotect
+```
+
+**Offset semantics.** Every `getUpdates` batch is stored in the `platform_events` outbox together with the new Telegram offset in a single SQLite commit. The offset therefore means *durably stored by the adapter*, not *delivered to Sprotect*; from that commit on, delivery is owned by the outbox. A crash before the commit simply makes Telegram resend the batch, and re-storing a known `telegram:<update_id>` is a no-op that keeps the original envelope.
+
+**Ordering.** Updates are partitioned by Telegram `chat_id`. Within a chat, events are delivered strictly in `update_id` order: the next event starts only after Sprotect ACKs the previous one with `202 accepted` or `200 duplicate`, and a retrying event is never overtaken. Different chats are delivered in parallel, with at most `EVENT_DELIVERY_CONCURRENCY` HTTP requests in flight. Updates without a usable chat (e.g. `poll`) are still forwarded raw in one shared `unrouted` FIFO partition. There is no global order across chats.
+
+**Group → supergroup migration.** When the old group's service message carries `migrate_to_chat_id`, later events of the new supergroup wait until that migration event is ACKed, rejected or expired; all other chats continue. The dependency is derived from durable rows, so it survives restarts.
+
+**Retries.** Network errors, `408` and `5xx` retry the unchanged envelope with exponential backoff per event; transient failures across several chats with no success in between pause all delivery briefly (circuit breaker). `429` pauses all chats for `Retry-After` (or the backoff when absent). `401` pauses all chats and is never counted against an event. Other `4xx` are retried up to `EVENT_MAX_ATTEMPTS` times, after which the event becomes `rejected` and stops blocking its chat. Each row keeps its attempt count, last HTTP status, last error and attempt times for diagnosis.
+
+**Retention and backpressure.** A pending event older than `EVENT_PENDING_TTL_SECONDS` becomes `expired` and leaves delivery. `delivered`, `rejected` and `expired` rows are deleted `EVENT_RETENTION_SECONDS` after they finish. When `EVENT_MAX_PENDING` events are pending, Telegram polling pauses until the backlog drains; updates meanwhile stay in Telegram.
+
+**Shutdown.** Stopping the adapter cancels in-flight HTTP deliveries; those events stay pending and are resent after restart, where Sprotect deduplicates them by `event_id` (at-least-once).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `EVENT_DELIVERY_CONCURRENCY` | `8` | Max simultaneous event deliveries (distinct chats), 1–256; also the HTTP pool size |
+| `EVENT_MAX_ATTEMPTS` | `5` | Permanent `4xx` failures before an event is `rejected` |
+| `EVENT_PENDING_TTL_SECONDS` | `172800` | Age after which an undelivered event expires (≥ 60) |
+| `EVENT_RETENTION_SECONDS` | `172800` | How long finished rows are kept for diagnosis |
+| `EVENT_MAX_PENDING` | `10000` | Pending events at which Telegram polling pauses |
+
+`platform_events_stats` log lines report pending and retrying events, oldest pending age, active partitions and deliveries, throughput, and retry/rejected/expired/migration-wait/backpressure counters; per-event logs carry `event_id`, `telegram_update_id` and `partition_key`.
 
 The adapter creates its durable local SQLite database at `/data/adapter.db`. Compose persists it in the `telegram-adapter-data` named volume. The volume includes the installation identity, pairing secret, and adapter token, so it must be retained when moving the adapter to another server. Losing it creates a new installation that must be paired again. If the server has already issued a one-time token but the local durable write was lost, the token cannot be recovered under the bootstrap security contract.
 

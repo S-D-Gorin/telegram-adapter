@@ -6,6 +6,9 @@ from typing import Any
 
 import httpx
 
+# Telegram Bot API accepts getUpdates limit values from 1 to 100.
+MAX_UPDATES_PER_REQUEST = 100
+
 
 class TelegramApiError(Exception):
     """A Telegram API failure. Exception messages deliberately omit bot tokens and payloads."""
@@ -29,8 +32,10 @@ class TelegramBotClient:
         self._client = client or httpx.AsyncClient(timeout=httpx.Timeout(35.0))
         self._owns_client = client is None
 
-    async def get_updates(self, offset: int | None, *, timeout: int = 30) -> list[dict[str, Any]]:
-        request_body: dict[str, int] = {"timeout": timeout}
+    async def get_updates(
+        self, offset: int | None, *, timeout: int = 30, limit: int = MAX_UPDATES_PER_REQUEST
+    ) -> list[dict[str, Any]]:
+        request_body: dict[str, int] = {"timeout": timeout, "limit": max(1, min(limit, MAX_UPDATES_PER_REQUEST))}
         if offset is not None:
             request_body["offset"] = offset
         try:

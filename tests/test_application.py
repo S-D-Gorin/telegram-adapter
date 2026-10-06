@@ -35,7 +35,7 @@ class BootstrapStub:
 
 
 class BlockingTelegramStub:
-    async def get_updates(self, offset, *, timeout=30):
+    async def get_updates(self, offset, *, timeout=30, limit=100):
         await asyncio.Event().wait()
 
     async def close(self) -> None:
