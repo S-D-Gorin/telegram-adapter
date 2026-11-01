@@ -1,0 +1,23 @@
+stages:
+  - mirror
+
+mirror-to-github:
+  stage: mirror
+  image: alpine:3.20
+  tags:
+    - docker
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  before_script:
+    - apk add --no-cache git openssh-client
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - cp "$GITHUB_SSH_KEY" ~/.ssh/id_ed25519
+    - chmod 600 ~/.ssh/id_ed25519
+    - ssh-keyscan github.com > ~/.ssh/known_hosts
+    - chmod 600 ~/.ssh/known_hosts
+  script:
+    - git remote add github git@github.com:S-D-Gorin/telegram-adapter.git
+    - git push github HEAD:refs/heads/main
+
+  
