@@ -1,12 +1,29 @@
 stages:
+  - test
   - mirror
   - build
+
+test:
+  stage: test
+  image: python:3.13-slim
+  tags:
+    - docker
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - python -m pip install --no-cache-dir ".[dev]"
+    - python -m pytest -q
 
 mirror-to-github:
   stage: mirror
   image: alpine:3.20
   tags:
     - docker
+  variables:
+    GIT_DEPTH: "0"
+  needs:
+    - test
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
   before_script:
@@ -28,6 +45,8 @@ build-docker:
   image: docker:cli
   tags:
     - docker
+  needs:
+    - mirror-to-github
   variables:
     DOCKER_HOST: unix:///var/run/docker.sock
   before_script:
@@ -41,4 +60,3 @@ build-docker:
     - docker push "sdg9999/sprotectbots-telegram-adapter:${CI_COMMIT_SHORT_SHA}"
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
-    
