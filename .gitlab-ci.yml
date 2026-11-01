@@ -25,24 +25,20 @@ mirror-to-github:
 
 build-docker:
   stage: build
-  image:
-    name: quay.io/buildah/stable:latest
-    entrypoint: [""]
+  image: docker:cli
   tags:
     - docker
   variables:
-    STORAGE_DRIVER: vfs
-    BUILDAH_ISOLATION: chroot
+    DOCKER_HOST: unix:///var/run/docker.sock
   before_script:
-    - echo "$DOCKERHUB_TOKEN" | buildah login
-        --username "$DOCKERHUB_USERNAME"
-        --password-stdin docker.io
+    - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
   script:
-    - buildah bud --isolation chroot
-        -t "docker.io/sdg9999/sprotectbots-telegram-adapter:latest"
-        -t "docker.io/sdg9999/sprotectbots-telegram-adapter:${CI_COMMIT_SHORT_SHA}"
+    - docker build
+        -t "sdg9999/sprotectbots-telegram-adapter:latest"
+        -t "sdg9999/sprotectbots-telegram-adapter:${CI_COMMIT_SHORT_SHA}"
         .
-    - buildah push "docker.io/sdg9999/sprotectbots-telegram-adapter:latest"
-    - buildah push "docker.io/sdg9999/sprotectbots-telegram-adapter:${CI_COMMIT_SHORT_SHA}"
+    - docker push "sdg9999/sprotectbots-telegram-adapter:latest"
+    - docker push "sdg9999/sprotectbots-telegram-adapter:${CI_COMMIT_SHORT_SHA}"
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
+    
