@@ -171,6 +171,20 @@ If a successful Telegram membership response authoritatively says `left`, `kicke
 
 All terminal outcomes use the common Platform Result envelope. Optional `raw_data` is diagnostic-only; Guardian domain logic must consume the normalized fields above.
 
+## SQLite backups
+
+The running container can create a consistent snapshot of its SQLite database without stopping the adapter. The source path comes from `DATA_DIR` through the adapter configuration; `FILE` is a path **inside the container**. Use a new destination name for each backup:
+
+```bash
+make backup-create FILE=/data/adapter-backup.db
+make backup-verify FILE=/data/adapter-backup.db
+docker compose cp telegram-adapter:/data/adapter-backup.db ./adapter-backup.db
+```
+
+For an existing destination, `make backup-create FILE=/data/adapter-backup.db OVERWRITE=1` explicitly replaces it. The equivalent direct commands are `docker compose exec -T telegram-adapter python -m app.backup create /data/adapter-backup.db` and `docker compose exec -T telegram-adapter python -m app.backup verify /data/adapter-backup.db`. Run against each Compose project separately when operating several adapter instances. Ansible can copy the verified snapshot from each instance and pass that file to Restic; it should act only after the create and verify commands return exit code 0.
+
+The command uses SQLite's Online Backup API, writes to a temporary file beside the destination, checks it with `PRAGMA integrity_check`, and publishes it atomically. Without overwrite, publication uses a hard link so a concurrent file at the destination cannot be replaced; the destination filesystem must support hard links. Explicit overwrite uses an atomic replace. The verifier opens a standalone snapshot read-only and does not create WAL sidecar files. The target directory must exist and be writable by the container's `adapter` user. The snapshot contains only the SQLite database, but that database stores adapter credentials, so restrict access to copied snapshots and remove staging copies after external backup completes.
+
 ## Production image versioning
 
 This contract-compatible release is version `0.3.0`. Do not deploy `:latest`. Build and publish the verified image deliberately, then pin Guardian deployment to the resulting immutable digest:
