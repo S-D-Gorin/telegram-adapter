@@ -1,5 +1,6 @@
 stages:
   - mirror
+  - build
 
 mirror-to-github:
   stage: mirror
@@ -22,4 +23,27 @@ mirror-to-github:
     - git remote add github git@github.com:S-D-Gorin/telegram-adapter.git
     - git push github HEAD:refs/heads/main
 
-  
+build-docker:
+  stage: build
+  image:
+    name: moby/buildkit:rootless
+    entrypoint: [""]
+  tags:
+    - docker
+  variables:
+    BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+  before_script:
+    - mkdir -p ~/.docker
+    - |
+      AUTH=$(printf '%s:%s' "$DOCKERHUB_USERNAME" "$DOCKERHUB_TOKEN" | base64 | tr -d '\n')
+      printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"}}}\n' "$AUTH" > ~/.docker/config.json
+      chmod 600 ~/.docker/config.json
+  script:
+    - |
+      buildctl-daemonless.sh build \
+        --frontend dockerfile.v0 \
+        --local context=. \
+        --local dockerfile=. \
+        --output "type=image,name=docker.io/sdg9999/sprotectbots-telegram-adapter:latest,docker.io/sdg9999/sprotectbots-telegram-adapter:${CI_COMMIT_SHORT_SHA},push=true"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'  
