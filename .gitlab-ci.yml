@@ -26,24 +26,23 @@ mirror-to-github:
 build-docker:
   stage: build
   image:
-    name: moby/buildkit:rootless
+    name: quay.io/buildah/stable:latest
     entrypoint: [""]
   tags:
     - docker
   variables:
-    BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+    STORAGE_DRIVER: vfs
+    BUILDAH_ISOLATION: chroot
   before_script:
-    - mkdir -p ~/.docker
-    - |
-      AUTH=$(printf '%s:%s' "$DOCKERHUB_USERNAME" "$DOCKERHUB_TOKEN" | base64 | tr -d '\n')
-      printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"}}}\n' "$AUTH" > ~/.docker/config.json
-      chmod 600 ~/.docker/config.json
+    - echo "$DOCKERHUB_TOKEN" | buildah login
+        --username "$DOCKERHUB_USERNAME"
+        --password-stdin docker.io
   script:
-    - |
-      buildctl-daemonless.sh build \
-        --frontend dockerfile.v0 \
-        --local context=. \
-        --local dockerfile=. \
-        --output "type=image,name=docker.io/sdg9999/sprotectbots-telegram-adapter:latest,docker.io/sdg9999/sprotectbots-telegram-adapter:${CI_COMMIT_SHORT_SHA},push=true"
+    - buildah bud --isolation chroot
+        -t "docker.io/sdg9999/sprotectbots-telegram-adapter:latest"
+        -t "docker.io/sdg9999/sprotectbots-telegram-adapter:${CI_COMMIT_SHORT_SHA}"
+        .
+    - buildah push "docker.io/sdg9999/sprotectbots-telegram-adapter:latest"
+    - buildah push "docker.io/sdg9999/sprotectbots-telegram-adapter:${CI_COMMIT_SHORT_SHA}"
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'  
+    - if: '$CI_COMMIT_BRANCH == "main"'
