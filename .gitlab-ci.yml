@@ -12,8 +12,10 @@ mirror-to-github:
     - apk add --no-cache git openssh-client
     - mkdir -p ~/.ssh
     - chmod 700 ~/.ssh
-    - cp "$GITHUB_SSH_KEY" ~/.ssh/id_ed25519
+    - cat "$GITHUB_SSH_KEY" > ~/.ssh/id_ed25519
+    - echo >> ~/.ssh/id_ed25519
     - chmod 600 ~/.ssh/id_ed25519
+    - ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null
     - ssh-keyscan github.com > ~/.ssh/known_hosts
     - chmod 600 ~/.ssh/known_hosts
   script:
